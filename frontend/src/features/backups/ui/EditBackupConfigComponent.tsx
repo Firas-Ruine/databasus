@@ -232,6 +232,7 @@ export const EditBackupConfigComponent = ({
               size="small"
               className="w-full max-w-[200px] grow"
               options={[
+                { label: 'Every 30 minutes', value: IntervalType.EVERY_30_MINUTES },
                 { label: 'Hourly', value: IntervalType.HOURLY },
                 { label: 'Daily', value: IntervalType.DAILY },
                 { label: 'Weekly', value: IntervalType.WEEKLY },
@@ -335,7 +336,8 @@ export const EditBackupConfigComponent = ({
             </>
           )}
 
-          {backupInterval?.interval !== IntervalType.HOURLY &&
+          {backupInterval?.interval !== IntervalType.EVERY_30_MINUTES &&
+            backupInterval?.interval !== IntervalType.HOURLY &&
             backupInterval?.interval !== IntervalType.CRON && (
               <div className="mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
                 <div className="mb-1 min-w-[150px] sm:mb-0">Backup time of day</div>

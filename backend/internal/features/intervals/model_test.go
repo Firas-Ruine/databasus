@@ -8,6 +8,44 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestInterval_ShouldTriggerBackup_Every30Minutes(t *testing.T) {
+	interval := &Interval{
+		ID:       uuid.New(),
+		Interval: IntervalEvery30Minutes,
+	}
+
+	baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("No previous backup: Trigger backup immediately", func(t *testing.T) {
+		should := interval.ShouldTriggerBackup(baseTime, nil)
+		assert.True(t, should)
+	})
+
+	t.Run("Last backup 29 minutes ago: Do not trigger backup", func(t *testing.T) {
+		lastBackup := baseTime.Add(-29 * time.Minute)
+		should := interval.ShouldTriggerBackup(baseTime, &lastBackup)
+		assert.False(t, should)
+	})
+
+	t.Run("Last backup exactly 30 minutes ago: Trigger backup", func(t *testing.T) {
+		lastBackup := baseTime.Add(-30 * time.Minute)
+		should := interval.ShouldTriggerBackup(baseTime, &lastBackup)
+		assert.True(t, should)
+	})
+
+	t.Run("Last backup 45 minutes ago: Trigger backup", func(t *testing.T) {
+		lastBackup := baseTime.Add(-45 * time.Minute)
+		should := interval.ShouldTriggerBackup(baseTime, &lastBackup)
+		assert.True(t, should)
+	})
+
+	t.Run("Last backup 1 hour ago: Trigger backup", func(t *testing.T) {
+		lastBackup := baseTime.Add(-1 * time.Hour)
+		should := interval.ShouldTriggerBackup(baseTime, &lastBackup)
+		assert.True(t, should)
+	})
+}
+
 func TestInterval_ShouldTriggerBackup_Hourly(t *testing.T) {
 	interval := &Interval{
 		ID:       uuid.New(),
@@ -634,6 +672,15 @@ func TestInterval_Validate(t *testing.T) {
 		interval := &Interval{
 			ID:       uuid.New(),
 			Interval: IntervalHourly,
+		}
+		err := interval.Validate()
+		assert.NoError(t, err)
+	})
+
+	t.Run("Every 30 minutes interval is valid without additional fields", func(t *testing.T) {
+		interval := &Interval{
+			ID:       uuid.New(),
+			Interval: IntervalEvery30Minutes,
 		}
 		err := interval.Validate()
 		assert.NoError(t, err)

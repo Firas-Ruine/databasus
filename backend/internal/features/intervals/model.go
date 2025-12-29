@@ -64,6 +64,8 @@ func (i *Interval) ShouldTriggerBackup(now time.Time, lastBackupTime *time.Time)
 	}
 
 	switch i.Interval {
+	case IntervalEvery30Minutes:
+		return now.Sub(*lastBackupTime) >= 30*time.Minute
 	case IntervalHourly:
 		return now.Sub(*lastBackupTime) >= time.Hour
 	case IntervalDaily:

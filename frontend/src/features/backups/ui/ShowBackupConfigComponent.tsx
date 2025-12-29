@@ -33,6 +33,7 @@ const weekdayLabels = {
 };
 
 const intervalLabels = {
+  [IntervalType.EVERY_30_MINUTES]: 'Every 30 minutes',
   [IntervalType.HOURLY]: 'Hourly',
   [IntervalType.DAILY]: 'Daily',
   [IntervalType.WEEKLY]: 'Weekly',
@@ -171,7 +172,8 @@ export const ShowBackupConfigComponent = ({ database }: Props) => {
             </>
           )}
 
-          {backupInterval?.interval !== IntervalType.HOURLY &&
+          {backupInterval?.interval !== IntervalType.EVERY_30_MINUTES &&
+            backupInterval?.interval !== IntervalType.HOURLY &&
             backupInterval?.interval !== IntervalType.CRON && (
               <div className="mb-1 flex w-full items-center">
                 <div className="min-w-[150px]">Backup time of day</div>

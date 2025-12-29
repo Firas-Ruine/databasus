@@ -1,4 +1,5 @@
 export enum IntervalType {
+  EVERY_30_MINUTES = 'EVERY_30_MINUTES',
   HOURLY = 'HOURLY',
   DAILY = 'DAILY',
   WEEKLY = 'WEEKLY',
