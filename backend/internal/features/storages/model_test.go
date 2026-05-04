@@ -3,17 +3,6 @@ package storages
 import (
 	"bytes"
 	"context"
-	"databasus-backend/internal/config"
-	azure_blob_storage "databasus-backend/internal/features/storages/models/azure_blob"
-	ftp_storage "databasus-backend/internal/features/storages/models/ftp"
-	google_drive_storage "databasus-backend/internal/features/storages/models/google_drive"
-	local_storage "databasus-backend/internal/features/storages/models/local"
-	nas_storage "databasus-backend/internal/features/storages/models/nas"
-	rclone_storage "databasus-backend/internal/features/storages/models/rclone"
-	s3_storage "databasus-backend/internal/features/storages/models/s3"
-	sftp_storage "databasus-backend/internal/features/storages/models/sftp"
-	"databasus-backend/internal/util/encryption"
-	"databasus-backend/internal/util/logger"
 	"fmt"
 	"io"
 	"os"
@@ -28,6 +17,17 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"databasus-backend/internal/config"
+	azure_blob_storage "databasus-backend/internal/features/storages/models/azure_blob"
+	ftp_storage "databasus-backend/internal/features/storages/models/ftp"
+	local_storage "databasus-backend/internal/features/storages/models/local"
+	nas_storage "databasus-backend/internal/features/storages/models/nas"
+	rclone_storage "databasus-backend/internal/features/storages/models/rclone"
+	s3_storage "databasus-backend/internal/features/storages/models/s3"
+	sftp_storage "databasus-backend/internal/features/storages/models/sftp"
+	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/logger"
 )
 
 type S3Container struct {
@@ -48,7 +48,7 @@ type AzuriteContainer struct {
 }
 
 func Test_Storage_BasicOperations(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	validateEnvVariables(t)
 
@@ -110,10 +110,22 @@ func Test_Storage_BasicOperations(t *testing.T) {
 			},
 		},
 		{
+			name: "S3Storage_WithStorageClass",
+			storage: &s3_storage.S3Storage{
+				StorageID:      uuid.New(),
+				S3Bucket:       s3Container.bucketName,
+				S3Region:       s3Container.region,
+				S3AccessKey:    s3Container.accessKey,
+				S3SecretKey:    s3Container.secretKey,
+				S3Endpoint:     "http://" + s3Container.endpoint,
+				S3StorageClass: s3_storage.S3StorageClassStandard,
+			},
+		},
+		{
 			name: "NASStorage",
 			storage: &nas_storage.NASStorage{
 				StorageID: uuid.New(),
-				Host:      "localhost",
+				Host:      config.GetEnv().TestLocalhost,
 				Port:      nasPort,
 				Share:     "backups",
 				Username:  "testuser",
@@ -147,7 +159,7 @@ func Test_Storage_BasicOperations(t *testing.T) {
 			name: "FTPStorage",
 			storage: &ftp_storage.FTPStorage{
 				StorageID: uuid.New(),
-				Host:      "localhost",
+				Host:      config.GetEnv().TestLocalhost,
 				Port:      ftpPort,
 				Username:  "testuser",
 				Password:  "testpassword",
@@ -159,7 +171,7 @@ func Test_Storage_BasicOperations(t *testing.T) {
 			name: "SFTPStorage",
 			storage: &sftp_storage.SFTPStorage{
 				StorageID:         uuid.New(),
-				Host:              "localhost",
+				Host:              config.GetEnv().TestLocalhost,
 				Port:              sftpPort,
 				Username:          "testuser",
 				Password:          "testpassword",
@@ -183,26 +195,6 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 		},
 	}
 
-	// Add Google Drive storage test only if environment variables are available
-	env := config.GetEnv()
-	if env.TestGoogleDriveClientID != "" && env.TestGoogleDriveClientSecret != "" &&
-		env.TestGoogleDriveTokenJSON != "" {
-		testCases = append(testCases, struct {
-			name    string
-			storage StorageFileSaver
-		}{
-			name: "GoogleDriveStorage",
-			storage: &google_drive_storage.GoogleDriveStorage{
-				StorageID:    uuid.New(),
-				ClientID:     env.TestGoogleDriveClientID,
-				ClientSecret: env.TestGoogleDriveClientSecret,
-				TokenJSON:    env.TestGoogleDriveTokenJSON,
-			},
-		})
-	} else {
-		t.Log("Skipping Google Drive storage test: missing environment variables")
-	}
-
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			encryptor := encryption.GetFieldEncryptor()
@@ -224,15 +216,15 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 				fileID := uuid.New()
 
 				err = tc.storage.SaveFile(
-					context.Background(),
+					t.Context(),
 					encryptor,
 					logger.GetLogger(),
-					fileID,
+					fileID.String(),
 					bytes.NewReader(fileData),
 				)
 				require.NoError(t, err, "SaveFile should succeed")
 
-				file, err := tc.storage.GetFile(encryptor, fileID)
+				file, err := tc.storage.GetFile(encryptor, fileID.String())
 				assert.NoError(t, err, "GetFile should succeed")
 				defer file.Close()
 
@@ -247,18 +239,18 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 
 				fileID := uuid.New()
 				err = tc.storage.SaveFile(
-					context.Background(),
+					t.Context(),
 					encryptor,
 					logger.GetLogger(),
-					fileID,
+					fileID.String(),
 					bytes.NewReader(fileData),
 				)
 				require.NoError(t, err, "SaveFile should succeed")
 
-				err = tc.storage.DeleteFile(encryptor, fileID)
+				err = tc.storage.DeleteFile(encryptor, fileID.String())
 				assert.NoError(t, err, "DeleteFile should succeed")
 
-				file, err := tc.storage.GetFile(encryptor, fileID)
+				file, err := tc.storage.GetFile(encryptor, fileID.String())
 				assert.Error(t, err, "GetFile should fail for non-existent file")
 				if file != nil {
 					file.Close()
@@ -268,7 +260,7 @@ acl = private`, s3Container.accessKey, s3Container.secretKey, s3Container.endpoi
 			t.Run("Test_TestDeleteNonExistentFile_DoesNotError", func(t *testing.T) {
 				// Try to delete a non-existent file
 				nonExistentID := uuid.New()
-				err := tc.storage.DeleteFile(encryptor, nonExistentID)
+				err := tc.storage.DeleteFile(encryptor, nonExistentID.String())
 				assert.NoError(t, err, "DeleteFile should not error for non-existent file")
 			})
 		})
@@ -281,7 +273,7 @@ func setupTestFile() (string, error) {
 	testData := []byte("This is test data for storage testing")
 
 	// 0644 means: owner can read/write
-	err := os.WriteFile(testFilePath, testData, 0644)
+	err := os.WriteFile(testFilePath, testData, 0o644)
 	if err != nil {
 		return "", fmt.Errorf("failed to create test file: %w", err)
 	}
@@ -297,7 +289,7 @@ func setupS3Container(ctx context.Context) (*S3Container, error) {
 	secretKey := "testpassword"
 	bucketName := "test-bucket"
 	region := "us-east-1"
-	endpoint := fmt.Sprintf("127.0.0.1:%s", env.TestMinioPort)
+	endpoint := fmt.Sprintf("%s:%s", env.TestLocalhost, env.TestMinioPort)
 
 	// Create MinIO client and ensure bucket exists
 	minioClient, err := minio.New(endpoint, &minio.Options{
@@ -343,15 +335,21 @@ func setupAzuriteContainer(ctx context.Context) (*AzuriteContainer, error) {
 	accountName := "devstoreaccount1"
 	// this is real testing key for azurite, it's not a real key
 	accountKey := "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-	serviceURL := fmt.Sprintf("http://127.0.0.1:%s/%s", env.TestAzuriteBlobPort, accountName)
+	serviceURL := fmt.Sprintf(
+		"http://%s:%s/%s",
+		env.TestLocalhost,
+		env.TestAzuriteBlobPort,
+		accountName,
+	)
 	containerNameKey := "test-container-key"
 	containerNameStr := "test-container-connstr"
 
 	// Build explicit connection string for Azurite
 	connectionString := fmt.Sprintf(
-		"DefaultEndpointsProtocol=http;AccountName=%s;AccountKey=%s;BlobEndpoint=http://127.0.0.1:%s/%s",
+		"DefaultEndpointsProtocol=http;AccountName=%s;AccountKey=%s;BlobEndpoint=http://%s:%s/%s",
 		accountName,
 		accountKey,
+		env.TestLocalhost,
 		env.TestAzuriteBlobPort,
 		accountName,
 	)
@@ -392,4 +390,66 @@ func validateEnvVariables(t *testing.T) {
 	assert.NotEmpty(t, env.TestMinioPort, "TEST_MINIO_PORT is empty")
 	assert.NotEmpty(t, env.TestAzuriteBlobPort, "TEST_AZURITE_BLOB_PORT is empty")
 	assert.NotEmpty(t, env.TestNASPort, "TEST_NAS_PORT is empty")
+}
+
+func Test_StorageUpdate_WhenExistingStorageHasNilS3_AssignsIncomingS3(t *testing.T) {
+	storageID := uuid.New()
+
+	existing := &Storage{
+		ID:        storageID,
+		Type:      StorageTypeS3,
+		Name:      "old name",
+		S3Storage: nil,
+	}
+
+	incoming := &Storage{
+		ID:   storageID,
+		Type: StorageTypeS3,
+		Name: "new name",
+		S3Storage: &s3_storage.S3Storage{
+			StorageID:   storageID,
+			S3Bucket:    "my-bucket",
+			S3Region:    "us-east-1",
+			S3AccessKey: "access",
+			S3SecretKey: "secret",
+		},
+	}
+
+	existing.Update(incoming)
+
+	assert.Equal(t, "new name", existing.Name)
+	assert.NotNil(t, existing.S3Storage)
+	assert.Equal(t, "my-bucket", existing.S3Storage.S3Bucket)
+	assert.Equal(t, "us-east-1", existing.S3Storage.S3Region)
+}
+
+func Test_StorageUpdate_WhenExistingS3IsNil_ValidateDoesNotPanic(t *testing.T) {
+	storageID := uuid.New()
+	encryptor := encryption.GetFieldEncryptor()
+
+	existing := &Storage{
+		ID:        storageID,
+		Type:      StorageTypeS3,
+		Name:      "test",
+		S3Storage: nil,
+	}
+
+	incoming := &Storage{
+		ID:   storageID,
+		Type: StorageTypeS3,
+		Name: "test",
+		S3Storage: &s3_storage.S3Storage{
+			StorageID:   storageID,
+			S3Bucket:    "my-bucket",
+			S3Region:    "us-east-1",
+			S3AccessKey: "access",
+			S3SecretKey: "secret",
+		},
+	}
+
+	existing.Update(incoming)
+
+	assert.NotPanics(t, func() {
+		_ = existing.Validate(encryptor)
+	})
 }

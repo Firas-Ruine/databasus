@@ -1,8 +1,8 @@
 <div align="center">
   <img src="assets/logo.svg" alt="Databasus Logo" width="250"/>
 
-  <h3>Backup tool for PostgreSQL, MySQL and MongoDB</h3>
-  <p>Databasus is a free, open source and self-hosted tool to backup databases. Make backups with different storages (S3, Google Drive, FTP, etc.) and notifications about progress (Slack, Discord, Telegram, etc.). Previously known as Postgresus (see migration guide).</p>
+  <h3>PostgreSQL backup tool (with MySQL\MariaDB and MongoDB support)</h3>
+  <p>Databasus is a free, open source and self-hosted tool to backup databases (with primary focus on PostgreSQL). Make backups with different storages (S3, Google Drive, FTP, etc.) and notifications about progress (Slack, Discord, Telegram, etc.)</p>
   
   <!-- Badges -->
    [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
@@ -11,7 +11,7 @@
   [![MongoDB](https://img.shields.io/badge/MongoDB-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
   <br />
   [![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-  [![Docker Pulls](https://img.shields.io/docker/pulls/rostislavdugin/postgresus?color=brightgreen)](https://hub.docker.com/r/rostislavdugin/postgresus)
+  [![Docker Pulls](https://img.shields.io/docker/pulls/databasus/databasus?color=brightgreen)](https://hub.docker.com/r/databasus/databasus)
   [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)](https://github.com/databasus/databasus)
   [![Self Hosted](https://img.shields.io/badge/self--hosted-yes-brightgreen)](https://github.com/databasus/databasus)
   [![Open Source](https://img.shields.io/badge/open%20source-❤️-red)](https://github.com/databasus/databasus)
@@ -31,8 +31,6 @@
   <img src="assets/dashboard-dark.svg" alt="Databasus Dark Dashboard" width="800" style="margin-bottom: 10px;"/>
 
   <img src="assets/dashboard.svg" alt="Databasus Dashboard" width="800"/>
-  
- 
 </div>
 
 ---
@@ -43,7 +41,7 @@
 
 - **PostgreSQL**: 12, 13, 14, 15, 16, 17 and 18
 - **MySQL**: 5.7, 8 and 9
-- **MariaDB**: 10 and 11
+- **MariaDB**: 10, 11 and 12
 - **MongoDB**: 4, 5, 6, 7 and 8
 
 ### 🔄 **Scheduled backups**
@@ -51,6 +49,13 @@
 - **Flexible scheduling**: hourly, daily, weekly, monthly or cron
 - **Precise timing**: run backups at specific times (e.g., 4 AM during low traffic)
 - **Smart compression**: 4-8x space savings with balanced compression (~20% overhead)
+
+### 🗑️ **Retention policies**
+
+- **Time period**: Keep backups for a fixed duration (e.g., 7 days, 3 months, 1 year)
+- **Count**: Keep a fixed number of the most recent backups (e.g., last 30)
+- **GFS (Grandfather-Father-Son)**: Layered retention — keep hourly, daily, weekly, monthly and yearly backups independently for fine-grained long-term history (enterprises requirement)
+- **Size limits**: Set per-backup and total storage size caps to control storage usage
 
 ### 🗄️ **Multiple storage destinations** <a href="https://databasus.com/storages">(view supported)</a>
 
@@ -71,6 +76,8 @@
 - **Encryption for secrets**: Any sensitive data is encrypted and never exposed, even in logs or error messages
 - **Read-only user**: Databasus uses a read-only user by default for backups and never stores anything that can modify your data
 
+It is also important for Databasus that you are able to decrypt and restore backups from storages (local, S3, etc.) without Databasus itself. To do so, read our guide on [how to recover directly from storage](https://databasus.com/how-to-recover-without-databasus). We avoid "vendor lock-in" even to open source tool!
+
 ### 👥 **Suitable for teams** <a href="https://databasus.com/access-management">(docs)</a>
 
 - **Workspaces**: Group databases, notifiers and storages for different projects or teams
@@ -84,14 +91,16 @@
 - **Dark & light themes**: Choose the look that suits your workflow
 - **Mobile adaptive**: Check your backups from anywhere on any device
 
-### ☁️ **Works with self-hosted & cloud databases**
+### 🔌 **Connection types**
 
-Databasus works seamlessly with both self-hosted PostgreSQL and cloud-managed databases:
+- **Remote** — Databasus connects directly to the database over the network (recommended in read-only mode). No agent or additional software required. Works with cloud-managed and self-hosted databases
+- **Agent** — A lightweight Databasus agent (written in Go) runs alongside the database. The agent streams backups directly to Databasus, so the database never needs to be exposed publicly. Supports host-installed databases and Docker containers
 
-- **Cloud support**: AWS RDS, Google Cloud SQL, Azure Database for PostgreSQL
-- **Self-hosted**: Any PostgreSQL instance you manage yourself
-- **Why no PITR support?**: Cloud providers already offer native PITR, and external PITR backups cannot be restored to managed cloud databases — making them impractical for cloud-hosted PostgreSQL
-- **Practical granularity**: Hourly and daily backups are sufficient for 99% of projects without the operational complexity of WAL archiving
+### 📦 **Backup types**
+
+- **Logical** — Native dump of the database in its engine-specific binary format. Compressed and streamed directly to storage with no intermediate files
+- **Physical** — File-level copy of the entire database cluster. Faster backup and restore for large datasets compared to logical dumps
+- **Incremental** — Physical base backup combined with continuous WAL segment archiving. Enables Point-in-time recovery (PITR) — restore to any second between backups. Designed for disaster recovery and near-zero data loss requirements
 
 ### 🐳 **Self-hosted & secure**
 
@@ -114,7 +123,7 @@ You have four ways to install Databasus:
 
 ## 📦 Installation
 
-You have three ways to install Databasus: automated script (recommended), simple Docker run, or Docker Compose setup.
+You have four ways to install Databasus: automated script (recommended), simple Docker run, or Docker Compose setup.
 
 ### Option 1: Automated installation script (recommended, Linux only)
 
@@ -220,8 +229,9 @@ For more options (NodePort, TLS, HTTPRoute for Gateway API), see the [Helm chart
 3. **Configure schedule**: Choose from hourly, daily, weekly, monthly or cron intervals
 4. **Set database connection**: Enter your database credentials and connection details
 5. **Choose storage**: Select where to store your backups (local, S3, Google Drive, etc.)
-6. **Add notifications** (optional): Configure email, Telegram, Slack, or webhook notifications
-7. **Save and start**: Databasus will validate settings and begin the backup schedule
+6. **Configure retention policy**: Choose time period, count or GFS to control how long backups are kept
+7. **Add notifications** (optional): Configure email, Telegram, Slack, or webhook notifications
+8. **Save and start**: Databasus will validate settings and begin the backup schedule
 
 ### 🔑 Resetting password <a href="https://databasus.com/password">(docs)</a>
 
@@ -233,55 +243,31 @@ docker exec -it databasus ./main --new-password="YourNewSecurePassword123" --ema
 
 Replace `admin` with the actual email address of the user whose password you want to reset.
 
+### 💾 Backuping Databasus itself
+
+After installation, it is also recommended to <a href="https://databasus.com/faq#backup-databasus">backup your Databasus itself</a> or, at least, to copy secret key used for encryption (30 seconds is needed). So you are able to restore from your encrypted backups if you lose access to the server with Databasus or it is corrupted.
+
 ---
 
 ## 📝 License
 
 This project is licensed under the Apache 2.0 License - see the [LICENSE](LICENSE) file for details
 
----
-
 ## 🤝 Contributing
 
 Contributions are welcome! Read the <a href="https://databasus.com/contribute">contributing guide</a> for more details, priorities and rules. If you want to contribute but don't know where to start, message me on Telegram [@rostislav_dugin](https://t.me/rostislav_dugin)
 
---
+Also you can join our large community of developers, DBAs and DevOps engineers on Telegram [@databasus_community](https://t.me/databasus_community).
 
-## 📖 Migration guide
+## FAQ
 
-Databasus is the new name for Postgresus. You can stay with latest version of Postgresus if you wish. If you want to migrate - follow installation steps for Databasus itself.
-
-Just renaming an image is not enough as Postgresus and Databasus use different data folders and internal database naming.
-
-You can put a new Databasus image with updated volume near the old Postgresus and run it (stop Postgresus before):
-
-```
-services:
-  databasus:
-    container_name: databasus
-    image: databasus/databasus:latest
-    ports:
-      - "4005:4005"
-    volumes:
-      - ./databasus-data:/databasus-data
-    restart: unless-stopped
-```
-
-Then manually move databases from Postgresus to Databasus.
-
-### Why was Postgresus renamed to Databasus?
-
-It was an important step for the project to grow. Actually, there are a couple of reasons:
-
-1. Postgresus is no longer a little tool that just adds UI for pg_dump for little projects. It became a tool both for individual users, DevOps, DBAs, teams, companies and even large enterprises. Tens of thousands of users use Postgresus every day. Postgresus grew into a reliable backup management tool. Initial positioning is no longer suitable: the project is not just a UI wrapper, it's a solid backup management system now (despite it's still easy to use).
-
-2. New databases are supported: although the primary focus is PostgreSQL (with 100% support in the most efficient way) and always will be, Databasus added support for MySQL, MariaDB and MongoDB. Later more databases will be supported.
-
-3. Trademark issue: "postgres" is a trademark of PostgreSQL Inc. and cannot be used in the project name. So for safety and legal reasons, we had to rename the project.
-
-## AI disclaimer
+### AI disclaimer
 
 There have been questions about AI usage in project development in issues and discussions. As the project focuses on security, reliability and production usage, it's important to explain how AI is used in the development process.
+
+First of all, we are proud to say that Databasus has been accepted into both [Claude for Open Source](https://claude.com/contact-sales/claude-for-oss) by Anthropic and [Codex for Open Source](https://developers.openai.com/codex/community/codex-for-oss/) by OpenAI in March 2026. For us it is one more signal that the project was recognized as important open-source software and was as critical infrastructure worth supporting independently by two of the world's leading AI companies. Read more at [databasus.com/faq](https://databasus.com/faq#oss-programs).
+
+Despite of this, we have the following rules how AI is used in the development process:
 
 AI is used as a helper for:
 
@@ -289,6 +275,7 @@ AI is used as a helper for:
 - cleaning up and improving documentation, comments and code
 - assistance during development
 - double-checking PRs and commits after human review
+- additional security analysis of PRs via Codex Security
 
 AI is not used for:
 
@@ -310,3 +297,13 @@ Moreover, it's important to note that we do not differentiate between bad human 
 Even if code is written manually by a human, it's not guaranteed to be merged. Vibe code is not allowed at all and all such PRs are rejected by default (see [contributing guide](https://databasus.com/contribute)).
 
 We also draw attention to fast issue resolution and security [vulnerability reporting](https://github.com/databasus/databasus?tab=security-ov-file#readme).
+
+### You have a cloud version — are you truly open source?
+
+Yes. Every feature available in Databasus Cloud is equally available in the self-hosted version with no restrictions, no feature gates and no usage limits. The entire codebase is Apache 2.0 licensed and always will be.
+
+Databasus is not "open core". We do not withhold features behind a paid tier and then call the limited remainder "open source" as projects like GitLab or Sentry do. We believe open source means the complete product is open, not just a marketing label on a stripped-down edition.
+
+Databasus Cloud runs the exact same code as the self-hosted version. The only difference is that we take care of infrastructure, availability, backups, reservations, monitoring and updates for you — so you don't have to. If you are using cloud, you can always move your databases from cloud to self-hosted if you wish.
+
+Revenue from Databasus Cloud funds full-time development of the project. Many open-source projects depend on corporate backing, sponsorships or volunteer maintainers, which can create long-term sustainability challenges. Recent discussions around [Tailwind](https://github.com/tailwindlabs/tailwindcss.com/pull/2388#issuecomment-3717222957) and the archival of [pgBackRest](https://github.com/pgbackrest/pgbackrest#notice-of-obsolescence) show that even popular or critical open-source projects need a durable funding model. Databasus Cloud is our way to make the project financially sustainable while keeping the full product open source, self-hostable and independent from any single corporate sponsor.

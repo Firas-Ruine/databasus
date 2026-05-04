@@ -1,24 +1,30 @@
 package notifiers
 
 import (
-	"errors"
 	"fmt"
 	"log/slog"
+
+	"github.com/google/uuid"
 
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	users_models "databasus-backend/internal/features/users/models"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	"databasus-backend/internal/util/encryption"
-
-	"github.com/google/uuid"
 )
 
 type NotifierService struct {
-	notifierRepository *NotifierRepository
-	logger             *slog.Logger
-	workspaceService   *workspaces_services.WorkspaceService
-	auditLogService    *audit_logs.AuditLogService
-	fieldEncryptor     encryption.FieldEncryptor
+	notifierRepository      *NotifierRepository
+	logger                  *slog.Logger
+	workspaceService        *workspaces_services.WorkspaceService
+	auditLogService         *audit_logs.AuditLogService
+	fieldEncryptor          encryption.FieldEncryptor
+	notifierDatabaseCounter NotifierDatabaseCounter
+}
+
+func (s *NotifierService) SetNotifierDatabaseCounter(
+	notifierDatabaseCounter NotifierDatabaseCounter,
+) {
+	s.notifierDatabaseCounter = notifierDatabaseCounter
 }
 
 func (s *NotifierService) SaveNotifier(
@@ -31,7 +37,7 @@ func (s *NotifierService) SaveNotifier(
 		return err
 	}
 	if !canManage {
-		return errors.New("insufficient permissions to manage notifier in this workspace")
+		return ErrInsufficientPermissionsToManageNotifier
 	}
 
 	isUpdate := notifier.ID != uuid.Nil
@@ -43,7 +49,7 @@ func (s *NotifierService) SaveNotifier(
 		}
 
 		if existingNotifier.WorkspaceID != workspaceID {
-			return errors.New("notifier does not belong to this workspace")
+			return ErrNotifierDoesNotBelongToWorkspace
 		}
 
 		existingNotifier.Update(notifier)
@@ -51,6 +57,8 @@ func (s *NotifierService) SaveNotifier(
 		if err := existingNotifier.EncryptSensitiveData(s.fieldEncryptor); err != nil {
 			return err
 		}
+
+		oldName := existingNotifier.Name
 
 		if err := existingNotifier.Validate(s.fieldEncryptor); err != nil {
 			return err
@@ -61,11 +69,23 @@ func (s *NotifierService) SaveNotifier(
 			return err
 		}
 
-		s.auditLogService.WriteAuditLog(
-			fmt.Sprintf("Notifier updated: %s", existingNotifier.Name),
-			&user.ID,
-			&workspaceID,
-		)
+		if oldName != existingNotifier.Name {
+			s.auditLogService.WriteAuditLog(
+				fmt.Sprintf(
+					"Notifier updated and renamed from '%s' to '%s'",
+					oldName,
+					existingNotifier.Name,
+				),
+				&user.ID,
+				&workspaceID,
+			)
+		} else {
+			s.auditLogService.WriteAuditLog(
+				fmt.Sprintf("Notifier updated: %s", existingNotifier.Name),
+				&user.ID,
+				&workspaceID,
+			)
+		}
 	} else {
 		notifier.WorkspaceID = workspaceID
 
@@ -106,7 +126,17 @@ func (s *NotifierService) DeleteNotifier(
 		return err
 	}
 	if !canManage {
-		return errors.New("insufficient permissions to manage notifier in this workspace")
+		return ErrInsufficientPermissionsToManageNotifier
+	}
+
+	attachedDatabasesIDs, err := s.notifierDatabaseCounter.GetNotifierAttachedDatabasesIDs(
+		notifier.ID,
+	)
+	if err != nil {
+		return err
+	}
+	if len(attachedDatabasesIDs) > 0 {
+		return ErrNotifierHasAttachedDatabases
 	}
 
 	err = s.notifierRepository.Delete(notifier)
@@ -137,11 +167,19 @@ func (s *NotifierService) GetNotifier(
 		return nil, err
 	}
 	if !canView {
-		return nil, errors.New("insufficient permissions to view notifier in this workspace")
+		return nil, ErrInsufficientPermissionsToViewNotifier
 	}
 
 	notifier.HideSensitiveData()
 	return notifier, nil
+}
+
+func (s *NotifierService) GetNotifierByID(id uuid.UUID) (*Notifier, error) {
+	return s.notifierRepository.FindByID(id)
+}
+
+func (s *NotifierService) GetAllNotifiers() ([]*Notifier, error) {
+	return s.notifierRepository.GetAllNotifiers()
 }
 
 func (s *NotifierService) GetNotifiers(
@@ -153,7 +191,7 @@ func (s *NotifierService) GetNotifiers(
 		return nil, err
 	}
 	if !canView {
-		return nil, errors.New("insufficient permissions to view notifiers in this workspace")
+		return nil, ErrInsufficientPermissionsToViewNotifiers
 	}
 
 	notifiers, err := s.notifierRepository.FindByWorkspaceID(workspaceID)
@@ -182,7 +220,7 @@ func (s *NotifierService) SendTestNotification(
 		return err
 	}
 	if !canView {
-		return errors.New("insufficient permissions to test notifier in this workspace")
+		return ErrInsufficientPermissionsToTestNotifier
 	}
 
 	err = notifier.Send(s.fieldEncryptor, s.logger, "Test message", "This is a test message")
@@ -210,7 +248,7 @@ func (s *NotifierService) SendTestNotificationToNotifier(
 		}
 
 		if existingNotifier.WorkspaceID != notifier.WorkspaceID {
-			return errors.New("notifier does not belong to this workspace")
+			return ErrNotifierDoesNotBelongToWorkspace
 		}
 
 		existingNotifier.Update(notifier)
@@ -267,6 +305,78 @@ func (s *NotifierService) SendNotification(
 	if err != nil {
 		s.logger.Error("Failed to save notifier", "error", err)
 	}
+}
+
+func (s *NotifierService) TransferNotifierToWorkspace(
+	user *users_models.User,
+	notifierID uuid.UUID,
+	targetWorkspaceID uuid.UUID,
+	transferingWithDbID *uuid.UUID,
+) error {
+	existingNotifier, err := s.notifierRepository.FindByID(notifierID)
+	if err != nil {
+		return err
+	}
+
+	canManageSource, err := s.workspaceService.CanUserManageDBs(existingNotifier.WorkspaceID, user)
+	if err != nil {
+		return err
+	}
+	if !canManageSource {
+		return ErrInsufficientPermissionsInSourceWorkspace
+	}
+
+	canManageTarget, err := s.workspaceService.CanUserManageDBs(targetWorkspaceID, user)
+	if err != nil {
+		return err
+	}
+	if !canManageTarget {
+		return ErrInsufficientPermissionsInTargetWorkspace
+	}
+
+	attachedDatabasesIDs, err := s.notifierDatabaseCounter.GetNotifierAttachedDatabasesIDs(
+		existingNotifier.ID,
+	)
+	if err != nil {
+		return err
+	}
+
+	if transferingWithDbID != nil {
+		for _, dbID := range attachedDatabasesIDs {
+			if dbID != *transferingWithDbID {
+				return ErrNotifierHasOtherAttachedDatabasesCannotTransfer
+			}
+		}
+	} else if len(attachedDatabasesIDs) > 0 {
+		return ErrNotifierHasAttachedDatabasesCannotTransfer
+	}
+
+	sourceWorkspaceID := existingNotifier.WorkspaceID
+	existingNotifier.WorkspaceID = targetWorkspaceID
+
+	_, err = s.notifierRepository.Save(existingNotifier)
+	if err != nil {
+		return err
+	}
+
+	sourceWorkspace, err := s.workspaceService.GetWorkspaceByID(sourceWorkspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to get source workspace: %w", err)
+	}
+
+	targetWorkspace, err := s.workspaceService.GetWorkspaceByID(targetWorkspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to get target workspace: %w", err)
+	}
+
+	s.auditLogService.WriteAuditLog(
+		fmt.Sprintf("Notifier transferred: %s from workspace '%s' to workspace '%s'",
+			existingNotifier.Name, sourceWorkspace.Name, targetWorkspace.Name),
+		&user.ID,
+		&targetWorkspaceID,
+	)
+
+	return nil
 }
 
 func (s *NotifierService) OnBeforeWorkspaceDeletion(workspaceID uuid.UUID) error {

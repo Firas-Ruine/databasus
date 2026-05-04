@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,46 +16,41 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 
+	env_config "databasus-backend/internal/config"
 	audit_logs "databasus-backend/internal/features/audit_logs"
-	"databasus-backend/internal/features/backups/backups"
+	backups_controllers "databasus-backend/internal/features/backups/backups/controllers"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
+	"databasus-backend/internal/features/databases/databases/mysql"
 	"databasus-backend/internal/features/databases/databases/postgresql"
-	"databasus-backend/internal/features/restores/models"
+	"databasus-backend/internal/features/notifiers"
+	restores_core "databasus-backend/internal/features/restores/core"
+	"databasus-backend/internal/features/restores/restoring"
 	"databasus-backend/internal/features/storages"
 	local_storage "databasus-backend/internal/features/storages/models/local"
+	tasks_cancellation "databasus-backend/internal/features/tasks/cancellation"
 	users_dto "databasus-backend/internal/features/users/dto"
 	users_enums "databasus-backend/internal/features/users/enums"
-	users_services "databasus-backend/internal/features/users/services"
 	users_testing "databasus-backend/internal/features/users/testing"
-	workspaces_controllers "databasus-backend/internal/features/workspaces/controllers"
 	workspaces_models "databasus-backend/internal/features/workspaces/models"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
+	cache_utils "databasus-backend/internal/util/cache"
 	util_encryption "databasus-backend/internal/util/encryption"
 	test_utils "databasus-backend/internal/util/testing"
 	"databasus-backend/internal/util/tools"
 )
 
-func createTestRouter() *gin.Engine {
-	router := workspaces_testing.CreateTestRouter(
-		workspaces_controllers.GetWorkspaceController(),
-		workspaces_controllers.GetMembershipController(),
-		databases.GetDatabaseController(),
-		backups_config.GetBackupConfigController(),
-		backups.GetBackupController(),
-		GetRestoreController(),
-	)
-	return router
-}
-
 func Test_GetRestores_WhenUserIsWorkspaceMember_RestoresReturned(t *testing.T) {
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
 
-	var restores []*models.Restore
+	var restores []*restores_core.Restore
 	test_utils.MakeGetRequestAndUnmarshal(
 		t,
 		router,
@@ -73,8 +69,10 @@ func Test_GetRestores_WhenUserIsNotWorkspaceMember_ReturnsForbidden(t *testing.T
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
-	_, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
 
 	nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
@@ -93,12 +91,14 @@ func Test_GetRestores_WhenUserIsGlobalAdmin_RestoresReturned(t *testing.T) {
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
-	_, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
 
 	admin := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
 
-	var restores []*models.Restore
+	var restores []*restores_core.Restore
 	test_utils.MakeGetRequestAndUnmarshal(
 		t,
 		router,
@@ -113,15 +113,21 @@ func Test_GetRestores_WhenUserIsGlobalAdmin_RestoresReturned(t *testing.T) {
 
 func Test_RestoreBackup_WhenUserIsWorkspaceMember_RestoreInitiated(t *testing.T) {
 	router := createTestRouter()
+
+	_, cleanup := SetupMockRestoreNode(t)
+	defer cleanup()
+
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
-	_, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
 
-	request := RestoreBackupRequest{
+	request := restores_core.RestoreBackupRequest{
 		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
 			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
+			Host:     env_config.GetEnv().TestLocalhost,
 			Port:     5432,
 			Username: "postgres",
 			Password: "postgres",
@@ -144,15 +150,17 @@ func Test_RestoreBackup_WhenUserIsNotWorkspaceMember_ReturnsForbidden(t *testing
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
-	_, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
 
 	nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
-	request := RestoreBackupRequest{
+	request := restores_core.RestoreBackupRequest{
 		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
 			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
+			Host:     env_config.GetEnv().TestLocalhost,
 			Port:     5432,
 			Username: "postgres",
 			Password: "postgres",
@@ -173,15 +181,21 @@ func Test_RestoreBackup_WhenUserIsNotWorkspaceMember_ReturnsForbidden(t *testing
 
 func Test_RestoreBackup_WithIsExcludeExtensions_FlagPassedCorrectly(t *testing.T) {
 	router := createTestRouter()
+
+	_, cleanup := SetupMockRestoreNode(t)
+	defer cleanup()
+
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
-	_, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
 
-	request := RestoreBackupRequest{
+	request := restores_core.RestoreBackupRequest{
 		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
 			Version:             tools.PostgresqlVersion16,
-			Host:                "localhost",
+			Host:                env_config.GetEnv().TestLocalhost,
 			Port:                5432,
 			Username:            "postgres",
 			Password:            "postgres",
@@ -203,15 +217,21 @@ func Test_RestoreBackup_WithIsExcludeExtensions_FlagPassedCorrectly(t *testing.T
 
 func Test_RestoreBackup_AuditLogWritten(t *testing.T) {
 	router := createTestRouter()
+
+	_, cleanup := SetupMockRestoreNode(t)
+	defer cleanup()
+
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
 
-	request := RestoreBackupRequest{
+	request := restores_core.RestoreBackupRequest{
 		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
 			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
+			Host:     env_config.GetEnv().TestLocalhost,
 			Port:     5432,
 			Username: "postgres",
 			Password: "postgres",
@@ -241,7 +261,7 @@ func Test_RestoreBackup_AuditLogWritten(t *testing.T) {
 
 	found := false
 	for _, log := range auditLogs.AuditLogs {
-		if strings.Contains(log.Message, "Database restored from backup") &&
+		if strings.Contains(log.Message, "Database restored for database") &&
 			strings.Contains(log.Message, database.Name) {
 			found = true
 			break
@@ -250,11 +270,328 @@ func Test_RestoreBackup_AuditLogWritten(t *testing.T) {
 	assert.True(t, found, "Audit log for restore not found")
 }
 
+func Test_RestoreBackup_DiskSpaceValidation(t *testing.T) {
+	tests := []struct {
+		name                string
+		dbType              databases.DatabaseType
+		cpuCount            int
+		expectDiskValidated bool
+	}{
+		{
+			name:                "PostgreSQL_CPU4_SpaceValidated",
+			dbType:              databases.DatabaseTypePostgres,
+			cpuCount:            4,
+			expectDiskValidated: true,
+		},
+		{
+			name:                "PostgreSQL_CPU1_SpaceNotValidated",
+			dbType:              databases.DatabaseTypePostgres,
+			cpuCount:            1,
+			expectDiskValidated: false,
+		},
+		{
+			name:                "MySQL_SpaceNotValidated",
+			dbType:              databases.DatabaseTypeMysql,
+			cpuCount:            3,
+			expectDiskValidated: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			router := createTestRouter()
+
+			// Setup mock node for tests that skip disk validation and reach scheduler
+			if !tc.expectDiskValidated {
+				_, cleanup := SetupMockRestoreNode(t)
+				defer cleanup()
+			}
+
+			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+			var database *databases.Database
+			var backup *backups_core.Backup
+			var storage *storages.Storage
+			var request restores_core.RestoreBackupRequest
+
+			if tc.dbType == databases.DatabaseTypePostgres {
+				database, backup = createTestDatabaseWithBackupForRestore(workspace, owner, router)
+				defer cleanupDatabaseWithBackup(database, backup)
+				request = restores_core.RestoreBackupRequest{
+					PostgresqlDatabase: &postgresql.PostgresqlDatabase{
+						Version:  tools.PostgresqlVersion16,
+						Host:     env_config.GetEnv().TestLocalhost,
+						Port:     5432,
+						Username: "postgres",
+						Password: "postgres",
+						CpuCount: tc.cpuCount,
+					},
+				}
+			} else {
+				mysqlDB := createTestMySQLDatabase(
+					"Test MySQL DB",
+					workspace.ID,
+					owner.Token,
+					router,
+				)
+				database = mysqlDB
+				storage = createTestStorage(workspace.ID)
+
+				defer func() {
+					// Cleanup in dependency order: backup -> database -> storage
+					cleanupBackup(backup)
+					databases.RemoveTestDatabase(mysqlDB)
+					time.Sleep(50 * time.Millisecond)
+					storages.RemoveTestStorage(storage.ID)
+				}()
+
+				configService := backups_config.GetBackupConfigService()
+				config, err := configService.GetBackupConfigByDbId(mysqlDB.ID)
+				assert.NoError(t, err)
+
+				config.IsBackupsEnabled = true
+				config.StorageID = &storage.ID
+				config.Storage = storage
+				_, err = configService.SaveBackupConfig(config)
+				assert.NoError(t, err)
+
+				backup = createTestBackup(mysqlDB, storage)
+
+				request = restores_core.RestoreBackupRequest{
+					MysqlDatabase: &mysql.MysqlDatabase{
+						Version:  tools.MysqlVersion80,
+						Host:     env_config.GetEnv().TestLocalhost,
+						Port:     3306,
+						Username: "root",
+						Password: "password",
+					},
+				}
+			}
+
+			// Set huge backup size (10 TB) that would fail disk validation if checked
+			repo := &backups_core.BackupRepository{}
+			backup.BackupSizeMb = 10485760.0
+			err := repo.Save(backup)
+			assert.NoError(t, err)
+
+			expectedStatus := http.StatusOK
+			if tc.expectDiskValidated {
+				expectedStatus = http.StatusBadRequest
+			}
+
+			testResp := test_utils.MakePostRequest(
+				t,
+				router,
+				fmt.Sprintf("/api/v1/restores/%s/restore", backup.ID.String()),
+				"Bearer "+owner.Token,
+				request,
+				expectedStatus,
+			)
+
+			bodyStr := string(testResp.Body)
+			if tc.expectDiskValidated {
+				assert.Contains(t, bodyStr, "is required")
+				assert.Contains(t, bodyStr, "is available")
+				assert.Contains(t, bodyStr, "disk space")
+			} else {
+				assert.Contains(t, bodyStr, "restore started successfully")
+			}
+		})
+	}
+}
+
+func Test_CancelRestore_InProgressRestore_SuccessfullyCancelled(t *testing.T) {
+	cache_utils.ClearAllCache()
+	tasks_cancellation.SetupDependencies()
+
+	user := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+	router := createTestRouter()
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", user, router)
+	storage := storages.CreateTestStorage(workspace.ID)
+	notifier := notifiers.CreateTestNotifier(workspace.ID)
+	database := databases.CreateTestDatabase(workspace.ID, storage, notifier)
+
+	defer func() {
+		backupRepo := backups_core.BackupRepository{}
+		backups, _ := backupRepo.FindByDatabaseID(database.ID)
+		for _, backup := range backups {
+			backupRepo.DeleteByID(backup.ID)
+		}
+
+		restoreRepo := restores_core.RestoreRepository{}
+		restores, _ := restoreRepo.FindByStatus(restores_core.RestoreStatusInProgress)
+		for _, restore := range restores {
+			restoreRepo.DeleteByID(restore.ID)
+		}
+		restores, _ = restoreRepo.FindByStatus(restores_core.RestoreStatusCanceled)
+		for _, restore := range restores {
+			restoreRepo.DeleteByID(restore.ID)
+		}
+
+		databases.RemoveTestDatabase(database)
+		time.Sleep(50 * time.Millisecond)
+		storages.RemoveTestStorage(storage.ID)
+		notifiers.RemoveTestNotifier(notifier)
+		workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+		cache_utils.ClearAllCache()
+	}()
+
+	backups_config.EnableBackupsForTestDatabase(database.ID, storage)
+	backup := backups_controllers.CreateTestBackup(database.ID, storage.ID)
+
+	mockUsecase := &restoring.MockBlockingRestoreUsecase{
+		StartedChan: make(chan bool, 1),
+	}
+	restorerNode := restoring.CreateTestRestorerNodeWithUsecase(mockUsecase)
+
+	cancelNode := restoring.StartRestorerNodeForTest(t, restorerNode)
+	defer cancelNode()
+
+	time.Sleep(200 * time.Millisecond)
+
+	restoreRequest := restores_core.RestoreBackupRequest{
+		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
+			Version:  tools.PostgresqlVersion16,
+			Host:     env_config.GetEnv().TestLocalhost,
+			Port:     5432,
+			Username: "postgres",
+			Password: "postgres",
+		},
+	}
+
+	var restoreResponse map[string]any
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/restores/%s/restore", backup.ID.String()),
+		"Bearer "+user.Token,
+		restoreRequest,
+		http.StatusOK,
+		&restoreResponse,
+	)
+
+	select {
+	case <-mockUsecase.StartedChan:
+		t.Log("Restore started and is blocking")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Restore did not start within timeout")
+	}
+
+	restoreRepo := &restores_core.RestoreRepository{}
+	restores, err := restoreRepo.FindByBackupID(backup.ID)
+	assert.NoError(t, err)
+	assert.Greater(t, len(restores), 0, "At least one restore should exist")
+
+	var restoreID uuid.UUID
+	for _, r := range restores {
+		if r.Status == restores_core.RestoreStatusInProgress {
+			restoreID = r.ID
+			break
+		}
+	}
+	assert.NotEqual(t, uuid.Nil, restoreID, "Should find an in-progress restore")
+
+	resp := test_utils.MakePostRequest(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/restores/cancel/%s", restoreID.String()),
+		"Bearer "+user.Token,
+		nil,
+		http.StatusNoContent,
+	)
+
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+
+	deadline := time.Now().UTC().Add(3 * time.Second)
+	var restore *restores_core.Restore
+	for time.Now().UTC().Before(deadline) {
+		restore, err = restoreRepo.FindByID(restoreID)
+		assert.NoError(t, err)
+		if restore.Status == restores_core.RestoreStatusCanceled {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	assert.Equal(t, restores_core.RestoreStatusCanceled, restore.Status)
+
+	auditLogService := audit_logs.GetAuditLogService()
+	auditLogs, err := auditLogService.GetWorkspaceAuditLogs(
+		workspace.ID,
+		&audit_logs.GetAuditLogsRequest{Limit: 100, Offset: 0},
+	)
+	assert.NoError(t, err)
+
+	foundCancelLog := false
+	for _, log := range auditLogs.AuditLogs {
+		if strings.Contains(log.Message, "Restore cancelled") &&
+			strings.Contains(log.Message, database.Name) {
+			foundCancelLog = true
+			break
+		}
+	}
+	assert.True(t, foundCancelLog, "Cancel audit log should be created")
+
+	time.Sleep(200 * time.Millisecond)
+}
+
+func Test_RestoreBackup_WithParallelRestoreInProgress_ReturnsError(t *testing.T) {
+	router := createTestRouter()
+
+	_, cleanup := SetupMockRestoreNode(t)
+	defer cleanup()
+
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
+
+	request := restores_core.RestoreBackupRequest{
+		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
+			Version:  tools.PostgresqlVersion16,
+			Host:     env_config.GetEnv().TestLocalhost,
+			Port:     5432,
+			Username: "postgres",
+			Password: "postgres",
+		},
+	}
+
+	testResp := test_utils.MakePostRequest(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/restores/%s/restore", backup.ID.String()),
+		"Bearer "+owner.Token,
+		request,
+		http.StatusOK,
+	)
+	assert.Contains(t, string(testResp.Body), "restore started successfully")
+
+	testResp2 := test_utils.MakePostRequest(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/restores/%s/restore", backup.ID.String()),
+		"Bearer "+owner.Token,
+		request,
+		http.StatusBadRequest,
+	)
+
+	assert.Contains(t, string(testResp2.Body), "another restore is already in progress")
+}
+
+func createTestRouter() *gin.Engine {
+	return CreateTestRouter()
+}
+
 func createTestDatabaseWithBackupForRestore(
 	workspace *workspaces_models.Workspace,
 	owner *users_dto.SignInResponseDTO,
 	router *gin.Engine,
-) (*databases.Database, *backups.Backup) {
+) (*databases.Database, *backups_core.Backup) {
 	database := createTestDatabase("Test Database", workspace.ID, owner.Token, router)
 	storage := createTestStorage(workspace.ID)
 
@@ -272,7 +609,7 @@ func createTestDatabaseWithBackupForRestore(
 		panic(err)
 	}
 
-	backup := createTestBackup(database, owner)
+	backup := createTestBackup(database, storage)
 
 	return database, backup
 }
@@ -283,20 +620,11 @@ func createTestDatabase(
 	token string,
 	router *gin.Engine,
 ) *databases.Database {
-	testDbName := "test_db"
 	request := databases.Database{
 		WorkspaceID: &workspaceID,
 		Name:        name,
 		Type:        databases.DatabaseTypePostgres,
-		Postgresql: &postgresql.PostgresqlDatabase{
-			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
-			Port:     5432,
-			Username: "postgres",
-			Password: "postgres",
-			Database: &testDbName,
-			CpuCount: 1,
-		},
+		Postgresql:  databases.GetTestPostgresConfig(),
 	}
 
 	w := workspaces_testing.MakeAPIRequest(
@@ -310,6 +638,64 @@ func createTestDatabase(
 	if w.Code != http.StatusCreated {
 		panic(
 			fmt.Sprintf("Failed to create database. Status: %d, Body: %s", w.Code, w.Body.String()),
+		)
+	}
+
+	var database databases.Database
+	if err := json.Unmarshal(w.Body.Bytes(), &database); err != nil {
+		panic(err)
+	}
+
+	return &database
+}
+
+func createTestMySQLDatabase(
+	name string,
+	workspaceID uuid.UUID,
+	token string,
+	router *gin.Engine,
+) *databases.Database {
+	env := env_config.GetEnv()
+	portStr := env.TestMysql80Port
+	if portStr == "" {
+		portStr = "33080"
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse TEST_MYSQL_80_PORT: %v", err))
+	}
+
+	testDbName := "testdb"
+	request := databases.Database{
+		WorkspaceID: &workspaceID,
+		Name:        name,
+		Type:        databases.DatabaseTypeMysql,
+		Mysql: &mysql.MysqlDatabase{
+			Version:  tools.MysqlVersion80,
+			Host:     env_config.GetEnv().TestLocalhost,
+			Port:     port,
+			Username: "testuser",
+			Password: "testpassword",
+			Database: &testDbName,
+		},
+	}
+
+	w := workspaces_testing.MakeAPIRequest(
+		router,
+		"POST",
+		"/api/v1/databases/create",
+		"Bearer "+token,
+		request,
+	)
+
+	if w.Code != http.StatusCreated {
+		panic(
+			fmt.Sprintf(
+				"Failed to create MySQL database. Status: %d, Body: %s",
+				w.Code,
+				w.Body.String(),
+			),
 		)
 	}
 
@@ -340,31 +726,21 @@ func createTestStorage(workspaceID uuid.UUID) *storages.Storage {
 
 func createTestBackup(
 	database *databases.Database,
-	owner *users_dto.SignInResponseDTO,
-) *backups.Backup {
+	storage *storages.Storage,
+) *backups_core.Backup {
 	fieldEncryptor := util_encryption.GetFieldEncryptor()
-	userService := users_services.GetUserService()
-	user, err := userService.GetUserFromToken(owner.Token)
-	if err != nil {
-		panic(err)
-	}
 
-	storages, err := storages.GetStorageService().GetStorages(user, *database.WorkspaceID)
-	if err != nil || len(storages) == 0 {
-		panic("No storage found for workspace")
-	}
-
-	backup := &backups.Backup{
+	backup := &backups_core.Backup{
 		ID:               uuid.New(),
 		DatabaseID:       database.ID,
-		StorageID:        storages[0].ID,
-		Status:           backups.BackupStatusCompleted,
+		StorageID:        storage.ID,
+		Status:           backups_core.BackupStatusCompleted,
 		BackupSizeMb:     10.5,
 		BackupDurationMs: 1000,
 		CreatedAt:        time.Now().UTC(),
 	}
 
-	repo := &backups.BackupRepository{}
+	repo := &backups_core.BackupRepository{}
 	if err := repo.Save(backup); err != nil {
 		panic(err)
 	}
@@ -372,9 +748,150 @@ func createTestBackup(
 	dummyContent := []byte("dummy backup content for testing")
 	reader := strings.NewReader(string(dummyContent))
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if err := storages[0].SaveFile(context.Background(), fieldEncryptor, logger, backup.ID, reader); err != nil {
+	if err := storage.SaveFile(
+		context.Background(),
+		fieldEncryptor,
+		logger,
+		backup.ID.String(),
+		reader,
+	); err != nil {
 		panic(fmt.Sprintf("Failed to create test backup file: %v", err))
 	}
 
 	return backup
+}
+
+func cleanupDatabaseWithBackup(database *databases.Database, backup *backups_core.Backup) {
+	// Clean up in reverse dependency order
+	cleanupBackup(backup)
+	databases.RemoveTestDatabase(database)
+	time.Sleep(50 * time.Millisecond)
+
+	// Clean up storage last (after database and backup are removed)
+	configService := backups_config.GetBackupConfigService()
+	config, err := configService.GetBackupConfigByDbId(database.ID)
+	if err == nil && config.StorageID != nil {
+		storages.RemoveTestStorage(*config.StorageID)
+	}
+}
+
+func Test_RestoreBackup_WhenCloudAndCpuCountMoreThanOne_ReturnsBadRequest(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
+
+	enableCloud(t)
+
+	request := restores_core.RestoreBackupRequest{
+		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
+			Version:  tools.PostgresqlVersion16,
+			Host:     env_config.GetEnv().TestLocalhost,
+			Port:     5432,
+			Username: "postgres",
+			Password: "postgres",
+			CpuCount: 4,
+		},
+	}
+
+	testResp := test_utils.MakePostRequest(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/restores/%s/restore", backup.ID.String()),
+		"Bearer "+owner.Token,
+		request,
+		http.StatusBadRequest,
+	)
+
+	assert.Contains(t, string(testResp.Body), "multi-thread restore is not supported in cloud mode")
+}
+
+func Test_RestoreBackup_WhenCloudAndCpuCountIsOne_RestoreInitiated(t *testing.T) {
+	router := createTestRouter()
+
+	_, cleanup := SetupMockRestoreNode(t)
+	defer cleanup()
+
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
+
+	enableCloud(t)
+
+	request := restores_core.RestoreBackupRequest{
+		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
+			Version:  tools.PostgresqlVersion16,
+			Host:     env_config.GetEnv().TestLocalhost,
+			Port:     5432,
+			Username: "postgres",
+			Password: "postgres",
+			CpuCount: 1,
+		},
+	}
+
+	testResp := test_utils.MakePostRequest(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/restores/%s/restore", backup.ID.String()),
+		"Bearer "+owner.Token,
+		request,
+		http.StatusOK,
+	)
+
+	assert.Contains(t, string(testResp.Body), "restore started successfully")
+}
+
+func Test_RestoreBackup_WhenNotCloudAndCpuCountMoreThanOne_RestoreInitiated(t *testing.T) {
+	router := createTestRouter()
+
+	_, cleanup := SetupMockRestoreNode(t)
+	defer cleanup()
+
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database, backup := createTestDatabaseWithBackupForRestore(workspace, owner, router)
+	defer cleanupDatabaseWithBackup(database, backup)
+
+	request := restores_core.RestoreBackupRequest{
+		PostgresqlDatabase: &postgresql.PostgresqlDatabase{
+			Version:  tools.PostgresqlVersion16,
+			Host:     env_config.GetEnv().TestLocalhost,
+			Port:     5432,
+			Username: "postgres",
+			Password: "postgres",
+			CpuCount: 4,
+		},
+	}
+
+	testResp := test_utils.MakePostRequest(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/restores/%s/restore", backup.ID.String()),
+		"Bearer "+owner.Token,
+		request,
+		http.StatusOK,
+	)
+
+	assert.Contains(t, string(testResp.Body), "restore started successfully")
+}
+
+func cleanupBackup(backup *backups_core.Backup) {
+	repo := &backups_core.BackupRepository{}
+	repo.DeleteByID(backup.ID)
+}
+
+func enableCloud(t *testing.T) {
+	t.Helper()
+	env_config.GetEnv().IsCloud = true
+	t.Cleanup(func() {
+		env_config.GetEnv().IsCloud = false
+	})
 }

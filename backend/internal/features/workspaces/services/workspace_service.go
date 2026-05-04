@@ -1,20 +1,20 @@
 package workspaces_services
 
 import (
-	"errors"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
 
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_models "databasus-backend/internal/features/users/models"
 	users_services "databasus-backend/internal/features/users/services"
 	workspaces_dto "databasus-backend/internal/features/workspaces/dto"
+	workspaces_errors "databasus-backend/internal/features/workspaces/errors"
 	workspaces_interfaces "databasus-backend/internal/features/workspaces/interfaces"
 	workspaces_models "databasus-backend/internal/features/workspaces/models"
 	workspaces_repositories "databasus-backend/internal/features/workspaces/repositories"
-
-	"github.com/google/uuid"
 )
 
 type WorkspaceService struct {
@@ -37,13 +37,12 @@ func (s *WorkspaceService) CreateWorkspace(
 	creator *users_models.User,
 ) (*workspaces_dto.WorkspaceResponseDTO, error) {
 	settings, err := s.settingsService.GetSettings()
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to get settings: %w", err)
 	}
 
 	if !creator.CanCreateWorkspaces(settings) {
-		return nil, errors.New("insufficient permissions to create workspaces")
+		return nil, workspaces_errors.ErrInsufficientPermissionsToCreateWorkspaces
 	}
 
 	workspace := &workspaces_models.Workspace{
@@ -91,7 +90,7 @@ func (s *WorkspaceService) GetWorkspace(
 		return nil, err
 	}
 	if !canView {
-		return nil, errors.New("insufficient permissions to view workspace")
+		return nil, workspaces_errors.ErrInsufficientPermissionsToViewWorkspace
 	}
 
 	return s.workspaceRepository.GetWorkspaceByID(workspaceID)
@@ -116,18 +115,19 @@ func (s *WorkspaceService) UpdateWorkspace(
 	user *users_models.User,
 ) (*workspaces_models.Workspace, error) {
 	canManage, err := s.CanUserManageWorkspace(workspaceID, user)
-
 	if err != nil {
 		return nil, err
 	}
 	if !canManage {
-		return nil, errors.New("insufficient permissions to update workspace")
+		return nil, workspaces_errors.ErrInsufficientPermissionsToUpdateWorkspace
 	}
 
 	existingWorkspace, err := s.workspaceRepository.GetWorkspaceByID(workspaceID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get workspace: %w", err)
 	}
+
+	oldName := existingWorkspace.Name
 
 	updateDTO.ID = workspaceID
 	updateDTO.CreatedAt = existingWorkspace.CreatedAt
@@ -138,11 +138,19 @@ func (s *WorkspaceService) UpdateWorkspace(
 		return nil, fmt.Errorf("failed to update workspace: %w", err)
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Workspace updated: %s", updateDTO.Name),
-		&user.ID,
-		&workspaceID,
-	)
+	if oldName != updateDTO.Name {
+		s.auditLogService.WriteAuditLog(
+			fmt.Sprintf("Workspace updated and renamed from '%s' to '%s'", oldName, updateDTO.Name),
+			&user.ID,
+			&workspaceID,
+		)
+	} else {
+		s.auditLogService.WriteAuditLog(
+			fmt.Sprintf("Workspace updated: %s", updateDTO.Name),
+			&user.ID,
+			&workspaceID,
+		)
+	}
 
 	return existingWorkspace, nil
 }
@@ -155,7 +163,7 @@ func (s *WorkspaceService) DeleteWorkspace(workspaceID uuid.UUID, user *users_mo
 		}
 
 		if userWorkspaceRole == nil || *userWorkspaceRole != users_enums.WorkspaceRoleOwner {
-			return errors.New("only workspace owner or admin can delete workspace")
+			return workspaces_errors.ErrOnlyOwnerOrAdminCanDeleteWorkspace
 		}
 	}
 
@@ -299,7 +307,7 @@ func (s *WorkspaceService) GetWorkspaceAuditLogs(
 		return nil, err
 	}
 	if !canView {
-		return nil, errors.New("insufficient permissions to view workspace audit logs")
+		return nil, workspaces_errors.ErrInsufficientPermissionsToViewWorkspaceAuditLogs
 	}
 
 	return s.auditLogService.GetWorkspaceAuditLogs(workspaceID, request)

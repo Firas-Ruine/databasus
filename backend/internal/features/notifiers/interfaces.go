@@ -1,8 +1,11 @@
 package notifiers
 
 import (
-	"databasus-backend/internal/util/encryption"
 	"log/slog"
+
+	"github.com/google/uuid"
+
+	"databasus-backend/internal/util/encryption"
 )
 
 type NotificationSender interface {
@@ -18,4 +21,8 @@ type NotificationSender interface {
 	HideSensitiveData()
 
 	EncryptSensitiveData(encryptor encryption.FieldEncryptor) error
+}
+
+type NotifierDatabaseCounter interface {
+	GetNotifierAttachedDatabasesIDs(notifierID uuid.UUID) ([]uuid.UUID, error)
 }

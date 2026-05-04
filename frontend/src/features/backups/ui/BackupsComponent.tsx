@@ -5,6 +5,8 @@ import {
   DeleteOutlined,
   DownloadOutlined,
   ExclamationCircleOutlined,
+  FilterFilled,
+  FilterOutlined,
   InfoCircleOutlined,
   LockOutlined,
   SyncOutlined,
@@ -14,28 +16,42 @@ import type { ColumnsType } from 'antd/es/table';
 import dayjs from 'dayjs';
 import { useEffect, useRef, useState } from 'react';
 
+import { IS_CLOUD } from '../../../constants';
 import {
   type Backup,
   type BackupConfig,
   BackupEncryption,
   BackupStatus,
+  PgWalBackupType,
   backupConfigApi,
   backupsApi,
 } from '../../../entity/backups';
-import { type Database, DatabaseType } from '../../../entity/databases';
+import type { BackupsFilters } from '../../../entity/backups/api/backupsApi';
+import { type Database, DatabaseType, PostgresBackupType } from '../../../entity/databases';
 import { getUserTimeFormat } from '../../../shared/time';
 import { ConfirmationComponent } from '../../../shared/ui';
 import { RestoresComponent } from '../../restores';
+import { AgentRestoreComponent } from './AgentRestoreComponent';
+import { BackupsBillingBannerComponent } from './BackupsBillingBannerComponent';
+import { BackupsFiltersPanelComponent } from './BackupsFiltersPanelComponent';
 
 const BACKUPS_PAGE_SIZE = 50;
 
 interface Props {
   database: Database;
   isCanManageDBs: boolean;
+  isDirectlyUnderTab?: boolean;
   scrollContainerRef?: React.RefObject<HTMLDivElement | null>;
+  onNavigateToBilling?: () => void;
 }
 
-export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef }: Props) => {
+export const BackupsComponent = ({
+  database,
+  isCanManageDBs,
+  isDirectlyUnderTab,
+  scrollContainerRef,
+  onNavigateToBilling,
+}: Props) => {
   const [isBackupsLoading, setIsBackupsLoading] = useState(false);
   const [backups, setBackups] = useState<Backup[]>([]);
 
@@ -56,34 +72,18 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
 
   const [showingRestoresBackupId, setShowingRestoresBackupId] = useState<string | undefined>();
 
-  const isReloadInProgress = useRef(false);
-  const isLazyLoadInProgress = useRef(false);
+  const lastRequestTimeRef = useRef<number>(0);
+  const isBackupsRequestInFlightRef = useRef(false);
 
   const [downloadingBackupId, setDownloadingBackupId] = useState<string | undefined>();
   const [cancellingBackupId, setCancellingBackupId] = useState<string | undefined>();
 
+  const [isFilterPanelVisible, setIsFilterPanelVisible] = useState(false);
+  const [filters, setFilters] = useState<BackupsFilters>({});
+
   const downloadBackup = async (backupId: string) => {
     try {
-      const blob = await backupsApi.downloadBackup(backupId);
-
-      // Create a download link
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-
-      // Find the backup to get a meaningful filename
-      const backup = backups.find((b) => b.id === backupId);
-      const createdAt = backup ? dayjs(backup.createdAt).format('YYYY-MM-DD_HH-mm-ss') : 'backup';
-      const extension = database.type === DatabaseType.MYSQL ? '.sql.zst' : '.dump.zst';
-      link.download = `${database.name}_backup_${createdAt}${extension}`;
-
-      // Trigger download
-      document.body.appendChild(link);
-      link.click();
-
-      // Cleanup
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(url);
+      await backupsApi.downloadBackup(backupId);
     } catch (e) {
       alert((e as Error).message);
     } finally {
@@ -91,86 +91,61 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
     }
   };
 
-  const loadBackups = async (limit?: number) => {
-    if (isReloadInProgress.current || isLazyLoadInProgress.current) {
-      return;
-    }
+  const loadBackups = async (limit?: number, filtersOverride?: BackupsFilters) => {
+    if (isBackupsRequestInFlightRef.current) return;
+    isBackupsRequestInFlightRef.current = true;
 
-    isReloadInProgress.current = true;
+    const requestTime = Date.now();
+    lastRequestTimeRef.current = requestTime;
+
+    const loadLimit = limit ?? currentLimit;
+    const activeFilters = filtersOverride ?? filters;
 
     try {
-      const loadLimit = limit || currentLimit;
-      const response = await backupsApi.getBackups(database.id, loadLimit, 0);
+      const response = await backupsApi.getBackups(database.id, loadLimit, 0, activeFilters);
+
+      if (lastRequestTimeRef.current !== requestTime) return;
 
       setBackups(response.backups);
       setTotalBackups(response.total);
       setHasMore(response.backups.length < response.total);
     } catch (e) {
-      alert((e as Error).message);
+      if (lastRequestTimeRef.current === requestTime) {
+        alert((e as Error).message);
+      }
+    } finally {
+      isBackupsRequestInFlightRef.current = false;
     }
-
-    isReloadInProgress.current = false;
-  };
-
-  const reloadInProgressBackups = async () => {
-    if (isReloadInProgress.current || isLazyLoadInProgress.current) {
-      return;
-    }
-
-    isReloadInProgress.current = true;
-
-    try {
-      // Fetch only the recent backups that could be in progress
-      // We fetch a small number (20) to capture recent backups that might be in progress
-      const response = await backupsApi.getBackups(database.id, 20, 0);
-
-      // Update only the backups that exist in both lists
-      setBackups((prevBackups) => {
-        const updatedBackups = [...prevBackups];
-
-        response.backups.forEach((newBackup) => {
-          const index = updatedBackups.findIndex((b) => b.id === newBackup.id);
-          if (index !== -1) {
-            updatedBackups[index] = newBackup;
-          } else if (index === -1 && updatedBackups.length < currentLimit) {
-            // New backup that doesn't exist yet (e.g., just created)
-            updatedBackups.unshift(newBackup);
-          }
-        });
-
-        return updatedBackups;
-      });
-
-      setTotalBackups(response.total);
-    } catch (e) {
-      alert((e as Error).message);
-    }
-
-    isReloadInProgress.current = false;
   };
 
   const loadMoreBackups = async () => {
-    if (isLoadingMore || !hasMore || isLazyLoadInProgress.current) {
+    if (isLoadingMore || !hasMore) {
       return;
     }
 
-    isLazyLoadInProgress.current = true;
     setIsLoadingMore(true);
 
+    const newLimit = currentLimit + BACKUPS_PAGE_SIZE;
+    setCurrentLimit(newLimit);
+
+    const requestTime = Date.now();
+    lastRequestTimeRef.current = requestTime;
+
     try {
-      const newLimit = currentLimit + BACKUPS_PAGE_SIZE;
-      const response = await backupsApi.getBackups(database.id, newLimit, 0);
+      const response = await backupsApi.getBackups(database.id, newLimit, 0, filters);
+
+      if (lastRequestTimeRef.current !== requestTime) return;
 
       setBackups(response.backups);
-      setCurrentLimit(newLimit);
       setTotalBackups(response.total);
       setHasMore(response.backups.length < response.total);
     } catch (e) {
-      alert((e as Error).message);
+      if (lastRequestTimeRef.current === requestTime) {
+        alert((e as Error).message);
+      }
     }
 
     setIsLoadingMore(false);
-    isLazyLoadInProgress.current = false;
   };
 
   const makeBackup = async () => {
@@ -215,7 +190,7 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
 
     try {
       await backupsApi.cancelBackup(backupId);
-      await reloadInProgressBackups();
+      await loadBackups();
     } catch (e) {
       alert((e as Error).message);
     }
@@ -239,22 +214,20 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
     return () => {};
   }, [database]);
 
-  // Reload backups that are in progress to update their state
   useEffect(() => {
-    const hasInProgressBackups = backups.some(
-      (backup) => backup.status === BackupStatus.IN_PROGRESS,
-    );
+    setCurrentLimit(BACKUPS_PAGE_SIZE);
+    setHasMore(true);
+    setIsBackupsLoading(true);
+    loadBackups(BACKUPS_PAGE_SIZE, filters).then(() => setIsBackupsLoading(false));
+  }, [filters]);
 
-    if (!hasInProgressBackups) {
-      return;
-    }
-
-    const timeoutId = setTimeout(async () => {
-      await reloadInProgressBackups();
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      loadBackups();
     }, 1_000);
 
-    return () => clearTimeout(timeoutId);
-  }, [backups]);
+    return () => clearInterval(intervalId);
+  }, [currentLimit, filters]);
 
   useEffect(() => {
     if (downloadingBackupId) {
@@ -344,24 +317,26 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
   const renderActions = (record: Backup) => {
     return (
       <div className="flex gap-2 text-lg">
-        {record.status === BackupStatus.IN_PROGRESS && isCanManageDBs && (
-          <div className="flex gap-2">
-            {cancellingBackupId === record.id ? (
-              <SyncOutlined spin />
-            ) : (
-              <Tooltip title="Cancel backup">
-                <CloseCircleOutlined
-                  className="cursor-pointer"
-                  onClick={() => {
-                    if (cancellingBackupId) return;
-                    cancelBackup(record.id);
-                  }}
-                  style={{ color: '#ff0000', opacity: cancellingBackupId ? 0.2 : 1 }}
-                />
-              </Tooltip>
-            )}
-          </div>
-        )}
+        {record.status === BackupStatus.IN_PROGRESS &&
+          isCanManageDBs &&
+          database.postgresql?.backupType !== PostgresBackupType.WAL_V1 && (
+            <div className="flex gap-2">
+              {cancellingBackupId === record.id ? (
+                <SyncOutlined spin />
+              ) : (
+                <Tooltip title="Cancel backup">
+                  <CloseCircleOutlined
+                    className="cursor-pointer"
+                    onClick={() => {
+                      if (cancellingBackupId) return;
+                      cancelBackup(record.id);
+                    }}
+                    style={{ color: '#ff0000', opacity: cancellingBackupId ? 0.2 : 1 }}
+                  />
+                </Tooltip>
+              )}
+            </div>
+          )}
 
         {record.status === BackupStatus.COMPLETED && (
           <div className="flex gap-2">
@@ -472,29 +447,6 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
       dataIndex: 'status',
       key: 'status',
       render: (status: BackupStatus, record: Backup) => renderStatus(status, record),
-      filters: [
-        {
-          value: BackupStatus.IN_PROGRESS,
-          text: 'In progress',
-        },
-        {
-          value: BackupStatus.FAILED,
-          text: 'Failed',
-        },
-        {
-          value: BackupStatus.COMPLETED,
-          text: 'Successful',
-        },
-        {
-          value: BackupStatus.DELETED,
-          text: 'Deleted',
-        },
-        {
-          value: BackupStatus.CANCELED,
-          text: 'Canceled',
-        },
-      ],
-      onFilter: (value, record) => record.status === value,
     },
     {
       title: (
@@ -511,7 +463,21 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
       dataIndex: 'backupSizeMb',
       key: 'backupSizeMb',
       width: 150,
-      render: (sizeMb: number) => formatSize(sizeMb),
+      render: (sizeMb: number, record: Backup) => (
+        <div className="flex items-center gap-2">
+          {formatSize(sizeMb)}
+          {record.pgWalBackupType === PgWalBackupType.PG_FULL_BACKUP && (
+            <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900 dark:text-blue-300">
+              FULL
+            </span>
+          )}
+          {record.pgWalBackupType === PgWalBackupType.PG_WAL_SEGMENT && (
+            <span className="rounded bg-purple-100 px-1.5 py-0.5 text-xs font-medium text-purple-700 dark:bg-purple-900 dark:text-purple-300">
+              WAL
+            </span>
+          )}
+        </div>
+      ),
     },
     {
       title: 'Duration',
@@ -528,6 +494,11 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
     },
   ];
 
+  const isAnyFilterApplied =
+    (filters.statuses && filters.statuses.length > 0) ||
+    filters.beforeDate !== undefined ||
+    filters.pgWalBackupType !== undefined;
+
   if (isBackupConfigLoading) {
     return (
       <div className="mb-5 flex items-center">
@@ -537,8 +508,46 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
   }
 
   return (
-    <div className="mt-5 w-full rounded-md bg-white p-3 shadow md:p-5 dark:bg-gray-800">
-      <h2 className="text-lg font-bold md:text-xl dark:text-white">Backups</h2>
+    <div
+      className={`w-full bg-white p-3 shadow md:p-5 dark:bg-gray-800 ${isDirectlyUnderTab ? 'rounded-tr-md rounded-br-md rounded-bl-md' : 'rounded-md'}`}
+    >
+      <div className="flex items-center gap-2">
+        <h2 className="text-lg font-bold md:text-xl dark:text-white">Backups</h2>
+        <div className="relative">
+          {isFilterPanelVisible ? (
+            <FilterFilled
+              className="cursor-pointer text-blue-600"
+              onClick={() => setIsFilterPanelVisible(false)}
+            />
+          ) : (
+            <FilterOutlined
+              className="cursor-pointer"
+              onClick={() => setIsFilterPanelVisible(true)}
+            />
+          )}
+          {!isFilterPanelVisible && isAnyFilterApplied && (
+            <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-blue-600" />
+          )}
+        </div>
+      </div>
+
+      {isFilterPanelVisible && (
+        <div className="mt-3">
+          <BackupsFiltersPanelComponent
+            filters={filters}
+            onFiltersChange={setFilters}
+            isWalDatabase={database.postgresql?.backupType === PostgresBackupType.WAL_V1}
+          />
+        </div>
+      )}
+
+      {IS_CLOUD && (
+        <BackupsBillingBannerComponent
+          databaseId={database.id}
+          isCanManageDBs={isCanManageDBs}
+          onNavigateToBilling={onNavigateToBilling}
+        />
+      )}
 
       {!isBackupConfigLoading && !backupConfig?.isBackupsEnabled && (
         <div className="text-sm text-red-600">
@@ -548,18 +557,20 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
 
       <div className="mt-5" />
 
-      <div className="flex">
-        <Button
-          onClick={makeBackup}
-          className="mr-1"
-          type="primary"
-          disabled={isMakeBackupRequestLoading}
-          loading={isMakeBackupRequestLoading}
-        >
-          <span className="md:hidden">Backup now</span>
-          <span className="hidden md:inline">Make backup right now</span>
-        </Button>
-      </div>
+      {database.postgresql?.backupType !== PostgresBackupType.WAL_V1 && (
+        <div className="flex items-center">
+          <Button
+            onClick={makeBackup}
+            className="mr-1"
+            type="primary"
+            disabled={isMakeBackupRequestLoading}
+            loading={isMakeBackupRequestLoading}
+          >
+            <span className="md:hidden">Backup now</span>
+            <span className="hidden md:inline">Make backup right now</span>
+          </Button>
+        </div>
+      )}
 
       <div className="mt-5 w-full md:max-w-[850px]">
         {/* Mobile card view */}
@@ -592,7 +603,19 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
                     <div className="grid grid-cols-2 gap-4">
                       <div>
                         <div className="text-xs text-gray-500 dark:text-gray-400">Size</div>
-                        <div className="text-sm font-medium">{formatSize(backup.backupSizeMb)}</div>
+                        <div className="flex items-center gap-2 text-sm font-medium">
+                          {formatSize(backup.backupSizeMb)}
+                          {backup.pgWalBackupType === PgWalBackupType.PG_FULL_BACKUP && (
+                            <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900 dark:text-blue-300">
+                              FULL
+                            </span>
+                          )}
+                          {backup.pgWalBackupType === PgWalBackupType.PG_WAL_SEGMENT && (
+                            <span className="rounded bg-purple-100 px-1.5 py-0.5 text-xs font-medium text-purple-700 dark:bg-purple-900 dark:text-purple-300">
+                              WAL
+                            </span>
+                          )}
+                        </div>
                       </div>
                       <div>
                         <div className="text-xs text-gray-500 dark:text-gray-400">Duration</div>
@@ -660,21 +683,36 @@ export const BackupsComponent = ({ database, isCanManageDBs, scrollContainerRef 
         />
       )}
 
-      {showingRestoresBackupId && (
-        <Modal
-          width={400}
-          open={!!showingRestoresBackupId}
-          onCancel={() => setShowingRestoresBackupId(undefined)}
-          title="Restore from backup"
-          footer={null}
-          maskClosable={false}
-        >
-          <RestoresComponent
-            database={database}
-            backup={backups.find((b) => b.id === showingRestoresBackupId) as Backup}
-          />
-        </Modal>
-      )}
+      {showingRestoresBackupId &&
+        (database.postgresql?.backupType === PostgresBackupType.WAL_V1 ? (
+          <Modal
+            width={600}
+            open={!!showingRestoresBackupId}
+            onCancel={() => setShowingRestoresBackupId(undefined)}
+            title="Restore from backup"
+            footer={null}
+            maskClosable={false}
+          >
+            <AgentRestoreComponent
+              database={database}
+              backup={backups.find((b) => b.id === showingRestoresBackupId) as Backup}
+            />
+          </Modal>
+        ) : (
+          <Modal
+            width={400}
+            open={!!showingRestoresBackupId}
+            onCancel={() => setShowingRestoresBackupId(undefined)}
+            title="Restore from backup"
+            footer={null}
+            maskClosable={false}
+          >
+            <RestoresComponent
+              database={database}
+              backup={backups.find((b) => b.id === showingRestoresBackupId) as Backup}
+            />
+          </Modal>
+        ))}
 
       {showingBackupError && (
         <Modal

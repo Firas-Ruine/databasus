@@ -2,7 +2,6 @@ package usecases_mysql
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -18,8 +17,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"databasus-backend/internal/config"
+	common "databasus-backend/internal/features/backups/backups/common"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backup_encryption "databasus-backend/internal/features/backups/backups/encryption"
-	usecases_common "databasus-backend/internal/features/backups/backups/usecases/common"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	mysqltypes "databasus-backend/internal/features/databases/databases/mysql"
@@ -52,21 +52,17 @@ type writeResult struct {
 
 func (uc *CreateMysqlBackupUsecase) Execute(
 	ctx context.Context,
-	backupID uuid.UUID,
+	backup *backups_core.Backup,
 	backupConfig *backups_config.BackupConfig,
 	db *databases.Database,
 	storage *storages.Storage,
 	backupProgressListener func(completedMBs float64),
-) (*usecases_common.BackupMetadata, error) {
+) (*common.BackupMetadata, error) {
 	uc.logger.Info(
 		"Creating MySQL backup via mysqldump",
 		"databaseId", db.ID,
 		"storageId", storage.ID,
 	)
-
-	if !backupConfig.IsBackupsEnabled {
-		return nil, fmt.Errorf("backups are not enabled for this database: \"%s\"", db.Name)
-	}
 
 	my := db.Mysql
 	if my == nil {
@@ -86,14 +82,9 @@ func (uc *CreateMysqlBackupUsecase) Execute(
 
 	return uc.streamToStorage(
 		ctx,
-		backupID,
+		backup,
 		backupConfig,
-		tools.GetMysqlExecutable(
-			my.Version,
-			tools.MysqlExecutableMysqldump,
-			config.GetEnv().EnvMode,
-			config.GetEnv().MysqlInstallDir,
-		),
+		tools.GetMysqlExecutable(my.Version, tools.MysqlExecutableMysqldump),
 		args,
 		decryptedPassword,
 		storage,
@@ -109,17 +100,30 @@ func (uc *CreateMysqlBackupUsecase) buildMysqldumpArgs(my *mysqltypes.MysqlDatab
 		"--user=" + my.Username,
 		"--single-transaction",
 		"--routines",
-		"--triggers",
-		"--events",
 		"--set-gtid-purged=OFF",
 		"--quick",
+		"--skip-extended-insert",
+		"--skip-add-locks",
 		"--verbose",
 	}
 
-	args = append(args, uc.getNetworkCompressionArgs(my.Version)...)
+	if my.HasPrivilege("TRIGGER") {
+		args = append(args, "--triggers")
+	}
+	if my.HasPrivilege("EVENT") {
+		args = append(args, "--events")
+	}
+
+	args = append(args, uc.getNetworkCompressionArgs(my)...)
+
+	if !config.GetEnv().IsCloud {
+		args = append(args, "--max-allowed-packet=1G")
+	}
 
 	if my.IsHttps {
 		args = append(args, "--ssl-mode=REQUIRED")
+	} else {
+		args = append(args, "--ssl-mode=DISABLED")
 	}
 
 	if my.Database != nil && *my.Database != "" {
@@ -129,15 +133,21 @@ func (uc *CreateMysqlBackupUsecase) buildMysqldumpArgs(my *mysqltypes.MysqlDatab
 	return args
 }
 
-func (uc *CreateMysqlBackupUsecase) getNetworkCompressionArgs(version tools.MysqlVersion) []string {
+func (uc *CreateMysqlBackupUsecase) getNetworkCompressionArgs(
+	my *mysqltypes.MysqlDatabase,
+) []string {
 	const zstdCompressionLevel = 5
 
-	switch version {
+	switch my.Version {
 	case tools.MysqlVersion80, tools.MysqlVersion84, tools.MysqlVersion9:
-		return []string{
-			"--compression-algorithms=zstd",
-			fmt.Sprintf("--zstd-compression-level=%d", zstdCompressionLevel),
+		if my.IsZstdSupported {
+			return []string{
+				"--compression-algorithms=zstd",
+				fmt.Sprintf("--zstd-compression-level=%d", zstdCompressionLevel),
+			}
 		}
+
+		return []string{"--compress"}
 	case tools.MysqlVersion57:
 		return []string{"--compress"}
 	default:
@@ -147,7 +157,7 @@ func (uc *CreateMysqlBackupUsecase) getNetworkCompressionArgs(version tools.Mysq
 
 func (uc *CreateMysqlBackupUsecase) streamToStorage(
 	parentCtx context.Context,
-	backupID uuid.UUID,
+	backup *backups_core.Backup,
 	backupConfig *backups_config.BackupConfig,
 	mysqlBin string,
 	args []string,
@@ -155,7 +165,7 @@ func (uc *CreateMysqlBackupUsecase) streamToStorage(
 	storage *storages.Storage,
 	backupProgressListener func(completedMBs float64),
 	myConfig *mysqltypes.MysqlDatabase,
-) (*usecases_common.BackupMetadata, error) {
+) (*common.BackupMetadata, error) {
 	uc.logger.Info("Streaming MySQL backup to storage", "mysqlBin", mysqlBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
@@ -198,7 +208,7 @@ func (uc *CreateMysqlBackupUsecase) streamToStorage(
 	storageReader, storageWriter := io.Pipe()
 
 	finalWriter, encryptionWriter, backupMetadata, err := uc.setupBackupEncryption(
-		backupID,
+		backup.ID,
 		backupConfig,
 		storageWriter,
 	)
@@ -211,11 +221,17 @@ func (uc *CreateMysqlBackupUsecase) streamToStorage(
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd writer: %w", err)
 	}
-	countingWriter := usecases_common.NewCountingWriter(zstdWriter)
+	countingWriter := common.NewCountingWriter(zstdWriter)
 
 	saveErrCh := make(chan error, 1)
 	go func() {
-		saveErr := storage.SaveFile(ctx, uc.fieldEncryptor, uc.logger, backupID, storageReader)
+		saveErr := storage.SaveFile(
+			ctx,
+			uc.fieldEncryptor,
+			uc.logger,
+			backup.FileName,
+			storageReader,
+		)
 		saveErrCh <- saveErr
 	}()
 
@@ -279,9 +295,16 @@ func (uc *CreateMysqlBackupUsecase) createTempMyCnfFile(
 	myConfig *mysqltypes.MysqlDatabase,
 	password string,
 ) (string, error) {
-	tempDir, err := os.MkdirTemp("", "mycnf")
+	// Credential files use OS temp dir (/tmp) because some filesystems
+	// (e.g. ZFS on TrueNAS) ignore chmod, causing "group or world access" errors.
+	tempDir, err := os.MkdirTemp(os.TempDir(), "mycnf_"+uuid.New().String())
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	if err := os.Chmod(tempDir, 0o700); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return "", fmt.Errorf("failed to set temp directory permissions: %w", err)
 	}
 
 	myCnfFile := filepath.Join(tempDir, ".my.cnf")
@@ -295,10 +318,13 @@ port=%d
 
 	if myConfig.IsHttps {
 		content += "ssl-mode=REQUIRED\n"
+	} else {
+		content += "ssl-mode=DISABLED\n"
 	}
 
-	err = os.WriteFile(myCnfFile, []byte(content), 0600)
+	err = os.WriteFile(myCnfFile, []byte(content), 0o600)
 	if err != nil {
+		_ = os.RemoveAll(tempDir)
 		return "", fmt.Errorf("failed to write .my.cnf: %w", err)
 	}
 
@@ -414,8 +440,10 @@ func (uc *CreateMysqlBackupUsecase) setupBackupEncryption(
 	backupID uuid.UUID,
 	backupConfig *backups_config.BackupConfig,
 	storageWriter io.WriteCloser,
-) (io.Writer, *backup_encryption.EncryptionWriter, usecases_common.BackupMetadata, error) {
-	metadata := usecases_common.BackupMetadata{}
+) (io.Writer, *backup_encryption.EncryptionWriter, common.BackupMetadata, error) {
+	metadata := common.BackupMetadata{
+		BackupID: backupID,
+	}
 
 	if backupConfig.Encryption != backups_config.BackupEncryptionEncrypted {
 		metadata.Encryption = backups_config.BackupEncryptionNone
@@ -423,40 +451,22 @@ func (uc *CreateMysqlBackupUsecase) setupBackupEncryption(
 		return storageWriter, nil, metadata, nil
 	}
 
-	salt, err := backup_encryption.GenerateSalt()
-	if err != nil {
-		return nil, nil, metadata, fmt.Errorf("failed to generate salt: %w", err)
-	}
-
-	nonce, err := backup_encryption.GenerateNonce()
-	if err != nil {
-		return nil, nil, metadata, fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
 	masterKey, err := uc.secretKeyService.GetSecretKey()
 	if err != nil {
 		return nil, nil, metadata, fmt.Errorf("failed to get master key: %w", err)
 	}
 
-	encWriter, err := backup_encryption.NewEncryptionWriter(
-		storageWriter,
-		masterKey,
-		backupID,
-		salt,
-		nonce,
-	)
+	encSetup, err := backup_encryption.SetupEncryptionWriter(storageWriter, masterKey, backupID)
 	if err != nil {
-		return nil, nil, metadata, fmt.Errorf("failed to create encrypting writer: %w", err)
+		return nil, nil, metadata, err
 	}
 
-	saltBase64 := base64.StdEncoding.EncodeToString(salt)
-	nonceBase64 := base64.StdEncoding.EncodeToString(nonce)
-	metadata.EncryptionSalt = &saltBase64
-	metadata.EncryptionIV = &nonceBase64
+	metadata.EncryptionSalt = &encSetup.SaltBase64
+	metadata.EncryptionIV = &encSetup.NonceBase64
 	metadata.Encryption = backups_config.BackupEncryptionEncrypted
 
 	uc.logger.Info("Encryption enabled for backup", "backupId", backupID)
-	return encWriter, encWriter, metadata, nil
+	return encSetup.Writer, encSetup.Writer, metadata, nil
 }
 
 func (uc *CreateMysqlBackupUsecase) cleanupOnCancellation(
@@ -549,8 +559,8 @@ func (uc *CreateMysqlBackupUsecase) buildMysqldumpErrorMessage(
 		stderrStr,
 	)
 
-	exitErr, ok := waitErr.(*exec.ExitError)
-	if !ok {
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
 		return errors.New(errorMsg)
 	}
 
@@ -575,6 +585,15 @@ func (uc *CreateMysqlBackupUsecase) handleConnectionErrors(stderrStr string) err
 		containsIgnoreCase(stderrStr, "connection refused") {
 		return fmt.Errorf(
 			"MySQL connection refused. Check if the server is running and accessible. stderr: %s",
+			stderrStr,
+		)
+	}
+
+	if containsIgnoreCase(stderrStr, "compression algorithm") ||
+		containsIgnoreCase(stderrStr, "2066") {
+		return fmt.Errorf(
+			"MySQL connection failed due to unsupported compression algorithm. "+
+				"Try re-saving the database connection to re-detect compression support. stderr: %s",
 			stderrStr,
 		)
 	}

@@ -1,15 +1,16 @@
 package healthcheck_config
 
 import (
-	"databasus-backend/internal/features/audit_logs"
-	"databasus-backend/internal/features/databases"
-	users_models "databasus-backend/internal/features/users/models"
-	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	"errors"
 	"fmt"
 	"log/slog"
 
 	"github.com/google/uuid"
+
+	"databasus-backend/internal/features/audit_logs"
+	"databasus-backend/internal/features/databases"
+	users_models "databasus-backend/internal/features/users/models"
+	workspaces_services "databasus-backend/internal/features/workspaces/services"
 )
 
 type HealthcheckConfigService struct {
@@ -132,9 +133,20 @@ func (s *HealthcheckConfigService) GetDatabasesWithEnabledHealthcheck() (
 func (s *HealthcheckConfigService) initializeDefaultConfig(
 	databaseID uuid.UUID,
 ) error {
+	isHealthcheckEnabled := true
+
+	database, err := s.databaseService.GetDatabaseByID(databaseID)
+	if err != nil {
+		return err
+	}
+
+	if database.IsAgentManagedBackup() {
+		isHealthcheckEnabled = false
+	}
+
 	return s.healthcheckConfigRepository.Save(&HealthcheckConfig{
 		DatabaseID:                        databaseID,
-		IsHealthcheckEnabled:              true,
+		IsHealthcheckEnabled:              isHealthcheckEnabled,
 		IsSentNotificationWhenUnavailable: true,
 		IntervalMinutes:                   1,
 		AttemptsBeforeConcideredAsDown:    3,

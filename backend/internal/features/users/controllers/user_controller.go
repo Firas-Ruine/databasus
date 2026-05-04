@@ -1,20 +1,24 @@
 package users_controllers
 
 import (
+	"errors"
 	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"databasus-backend/internal/config"
 	user_dto "databasus-backend/internal/features/users/dto"
+	users_errors "databasus-backend/internal/features/users/errors"
 	user_middleware "databasus-backend/internal/features/users/middleware"
 	users_services "databasus-backend/internal/features/users/services"
-
-	"github.com/gin-gonic/gin"
-	"golang.org/x/time/rate"
+	cache_utils "databasus-backend/internal/util/cache"
+	cloudflare_turnstile "databasus-backend/internal/util/cloudflare_turnstile"
 )
 
 type UserController struct {
-	userService   *users_services.UserService
-	signinLimiter *rate.Limiter
+	userService *users_services.UserService
+	rateLimiter *cache_utils.RateLimiter
 }
 
 func (c *UserController) RegisterRoutes(router *gin.RouterGroup) {
@@ -24,6 +28,10 @@ func (c *UserController) RegisterRoutes(router *gin.RouterGroup) {
 	// Admin password setup (no auth required)
 	router.GET("/users/admin/has-password", c.IsAdminHasPassword)
 	router.POST("/users/admin/set-password", c.SetAdminPassword)
+
+	// Password reset (no auth required)
+	router.POST("/users/send-reset-password-code", c.SendResetPasswordCode)
+	router.POST("/users/reset-password", c.ResetPassword)
 
 	// OAuth callbacks
 	router.POST("/auth/github/callback", c.HandleGitHubOAuth)
@@ -37,10 +45,6 @@ func (c *UserController) RegisterProtectedRoutes(router *gin.RouterGroup) {
 	router.POST("/users/invite", c.InviteUser)
 }
 
-func (c *UserController) SetSignInLimiter(limiter *rate.Limiter) {
-	c.signinLimiter = limiter
-}
-
 // SignUp
 // @Summary Register a new user
 // @Description Register a new user with email and password
@@ -48,7 +52,7 @@ func (c *UserController) SetSignInLimiter(limiter *rate.Limiter) {
 // @Accept json
 // @Produce json
 // @Param request body users_dto.SignUpRequestDTO true "User signup data"
-// @Success 200
+// @Success 200 {object} users_dto.SignInResponseDTO
 // @Failure 400
 // @Router /users/signup [post]
 func (c *UserController) SignUp(ctx *gin.Context) {
@@ -58,13 +62,41 @@ func (c *UserController) SignUp(ctx *gin.Context) {
 		return
 	}
 
-	err := c.userService.SignUp(&request)
+	// Verify Cloudflare Turnstile if enabled
+	turnstileService := cloudflare_turnstile.GetCloudflareTurnstileService()
+	if turnstileService.IsEnabled() {
+		if request.CloudflareTurnstileToken == nil || *request.CloudflareTurnstileToken == "" {
+			ctx.JSON(
+				http.StatusBadRequest,
+				gin.H{"error": "Cloudflare Turnstile verification required"},
+			)
+			return
+		}
+
+		clientIP := ctx.ClientIP()
+		isValid, err := turnstileService.VerifyToken(*request.CloudflareTurnstileToken, clientIP)
+		if err != nil || !isValid {
+			ctx.JSON(
+				http.StatusBadRequest,
+				gin.H{"error": "Cloudflare Turnstile verification failed"},
+			)
+			return
+		}
+	}
+
+	user, err := c.userService.SignUp(&request)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	ctx.JSON(http.StatusOK, gin.H{"message": "User created successfully"})
+	response, err := c.userService.GenerateAccessToken(user)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, response)
 }
 
 // SignIn
@@ -79,18 +111,40 @@ func (c *UserController) SignUp(ctx *gin.Context) {
 // @Failure 429 {object} map[string]string "Rate limit exceeded"
 // @Router /users/signin [post]
 func (c *UserController) SignIn(ctx *gin.Context) {
-	// We use rate limiter to prevent brute force attacks
-	if !c.signinLimiter.Allow() {
+	var request user_dto.SignInRequestDTO
+	if err := ctx.ShouldBindJSON(&request); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	// Verify Cloudflare Turnstile if enabled
+	turnstileService := cloudflare_turnstile.GetCloudflareTurnstileService()
+	if turnstileService.IsEnabled() {
+		if request.CloudflareTurnstileToken == nil || *request.CloudflareTurnstileToken == "" {
+			ctx.JSON(
+				http.StatusBadRequest,
+				gin.H{"error": "Cloudflare Turnstile verification required"},
+			)
+			return
+		}
+
+		clientIP := ctx.ClientIP()
+		isValid, err := turnstileService.VerifyToken(*request.CloudflareTurnstileToken, clientIP)
+		if err != nil || !isValid {
+			ctx.JSON(
+				http.StatusBadRequest,
+				gin.H{"error": "Cloudflare Turnstile verification failed"},
+			)
+			return
+		}
+	}
+
+	allowed, _ := c.rateLimiter.CheckLimit(request.Email, "signin", 10, 1*time.Minute)
+	if !allowed {
 		ctx.JSON(
 			http.StatusTooManyRequests,
 			gin.H{"error": "Rate limit exceeded. Please try again later."},
 		)
-		return
-	}
-
-	var request user_dto.SignInRequestDTO
-	if err := ctx.ShouldBindJSON(&request); err != nil {
-		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
 		return
 	}
 
@@ -206,7 +260,7 @@ func (c *UserController) InviteUser(ctx *gin.Context) {
 
 	response, err := c.userService.InviteUser(&request, user)
 	if err != nil {
-		if err.Error() == "insufficient permissions to invite users" {
+		if errors.Is(err, users_errors.ErrInsufficientPermissionsToInviteUsers) {
 			ctx.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 			return
 		}
@@ -340,4 +394,93 @@ func (c *UserController) HandleGoogleOAuth(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, response)
+}
+
+// SendResetPasswordCode
+// @Summary Send password reset code
+// @Description Send a password reset code to the user's email
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param request body users_dto.SendResetPasswordCodeRequestDTO true "Email address"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Failure 429 {object} map[string]string
+// @Router /users/send-reset-password-code [post]
+func (c *UserController) SendResetPasswordCode(ctx *gin.Context) {
+	var request user_dto.SendResetPasswordCodeRequestDTO
+	if err := ctx.ShouldBindJSON(&request); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	// Verify Cloudflare Turnstile if enabled
+	turnstileService := cloudflare_turnstile.GetCloudflareTurnstileService()
+	if turnstileService.IsEnabled() {
+		if request.CloudflareTurnstileToken == nil || *request.CloudflareTurnstileToken == "" {
+			ctx.JSON(
+				http.StatusBadRequest,
+				gin.H{"error": "Cloudflare Turnstile verification required"},
+			)
+			return
+		}
+
+		clientIP := ctx.ClientIP()
+		isValid, err := turnstileService.VerifyToken(*request.CloudflareTurnstileToken, clientIP)
+		if err != nil || !isValid {
+			ctx.JSON(
+				http.StatusBadRequest,
+				gin.H{"error": "Cloudflare Turnstile verification failed"},
+			)
+			return
+		}
+	}
+
+	allowed, _ := c.rateLimiter.CheckLimit(
+		request.Email,
+		"reset-password",
+		3,
+		1*time.Hour,
+	)
+	if !allowed {
+		ctx.JSON(
+			http.StatusTooManyRequests,
+			gin.H{"error": "Rate limit exceeded. Please try again later."},
+		)
+		return
+	}
+
+	err := c.userService.SendResetPasswordCode(request.Email)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "If the email exists, a reset code has been sent"})
+}
+
+// ResetPassword
+// @Summary Reset password with code
+// @Description Reset user password using the code sent via email
+// @Tags users
+// @Accept json
+// @Produce json
+// @Param request body users_dto.ResetPasswordRequestDTO true "Reset password data"
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} map[string]string
+// @Router /users/reset-password [post]
+func (c *UserController) ResetPassword(ctx *gin.Context) {
+	var request user_dto.ResetPasswordRequestDTO
+	if err := ctx.ShouldBindJSON(&request); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
+		return
+	}
+
+	err := c.userService.ResetPassword(request.Email, request.Code, request.NewPassword)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "Password reset successfully"})
 }

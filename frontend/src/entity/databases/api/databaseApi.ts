@@ -88,6 +88,19 @@ export const databaseApi = {
       .then((res) => res.isUsing);
   },
 
+  async getDatabasesCountForNotifier(notifierId: string): Promise<number> {
+    const requestOptions: RequestOptions = new RequestOptions();
+    return apiHelper
+      .fetchGetJson<{
+        count: number;
+      }>(
+        `${getApplicationServer()}/api/v1/databases/notifier/${notifierId}/databases-count`,
+        requestOptions,
+        true,
+      )
+      .then((res) => res.count);
+  },
+
   async isUserReadOnly(database: Database) {
     const requestOptions: RequestOptions = new RequestOptions();
     requestOptions.setBody(JSON.stringify(database));
@@ -102,6 +115,14 @@ export const databaseApi = {
     requestOptions.setBody(JSON.stringify(database));
     return apiHelper.fetchPostJson<CreateReadOnlyUserResponse>(
       `${getApplicationServer()}/api/v1/databases/create-readonly-user`,
+      requestOptions,
+    );
+  },
+
+  async regenerateAgentToken(id: string): Promise<{ token: string }> {
+    const requestOptions: RequestOptions = new RequestOptions();
+    return apiHelper.fetchPostJson<{ token: string }>(
+      `${getApplicationServer()}/api/v1/databases/${id}/regenerate-token`,
       requestOptions,
     );
   },

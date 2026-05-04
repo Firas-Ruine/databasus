@@ -1,6 +1,7 @@
 import { Button, Modal, Spin } from 'antd';
 import { useEffect, useState } from 'react';
 
+import { IS_CLOUD } from '../../../../constants';
 import { type Database, DatabaseType, databaseApi } from '../../../../entity/databases';
 
 interface Props {
@@ -8,31 +9,64 @@ interface Props {
   onReadOnlyUserUpdated: (database: Database) => void;
 
   onGoBack: () => void;
-  onContinue: () => void;
+  onSkipped: () => void;
+  onAlreadyExists: () => void;
 }
+
+const PRIVILEGES_TRUNCATE_LENGTH = 50;
 
 export const CreateReadOnlyComponent = ({
   database,
   onReadOnlyUserUpdated,
   onGoBack,
-  onContinue,
+  onSkipped,
+  onAlreadyExists,
 }: Props) => {
   const [isCheckingReadOnlyUser, setIsCheckingReadOnlyUser] = useState(false);
   const [isCreatingReadOnlyUser, setIsCreatingReadOnlyUser] = useState(false);
   const [isShowSkipConfirmation, setShowSkipConfirmation] = useState(false);
+  const [privileges, setPrivileges] = useState<string[]>([]);
+  const [isPrivilegesExpanded, setIsPrivilegesExpanded] = useState(false);
 
   const isPostgres = database.type === DatabaseType.POSTGRES;
   const isMysql = database.type === DatabaseType.MYSQL;
-  const databaseTypeName = isPostgres ? 'PostgreSQL' : isMysql ? 'MySQL' : 'database';
+  const isMariadb = database.type === DatabaseType.MARIADB;
+  const isMongodb = database.type === DatabaseType.MONGODB;
+  const databaseTypeName = isPostgres
+    ? 'PostgreSQL'
+    : isMysql
+      ? 'MySQL'
+      : isMariadb
+        ? 'MariaDB'
+        : isMongodb
+          ? 'MongoDB'
+          : 'database';
+
+  const privilegesLabel = isMongodb ? 'roles' : 'privileges';
 
   const checkReadOnlyUser = async (): Promise<boolean> => {
     try {
       const response = await databaseApi.isUserReadOnly(database);
+      setPrivileges(response.privileges || []);
       return response.isReadOnly;
     } catch (e) {
       alert((e as Error).message);
       return false;
     }
+  };
+
+  const getPrivilegesDisplay = () => {
+    const fullText = privileges.join(', ');
+    if (isPrivilegesExpanded || fullText.length <= PRIVILEGES_TRUNCATE_LENGTH) {
+      return fullText;
+    }
+
+    return fullText.substring(0, PRIVILEGES_TRUNCATE_LENGTH) + '...';
+  };
+
+  const shouldShowExpandToggle = () => {
+    const fullText = privileges.join(', ');
+    return fullText.length > PRIVILEGES_TRUNCATE_LENGTH;
   };
 
   const createReadOnlyUser = async () => {
@@ -47,10 +81,15 @@ export const CreateReadOnlyComponent = ({
       } else if (isMysql && database.mysql) {
         database.mysql.username = response.username;
         database.mysql.password = response.password;
+      } else if (isMariadb && database.mariadb) {
+        database.mariadb.username = response.username;
+        database.mariadb.password = response.password;
+      } else if (isMongodb && database.mongodb) {
+        database.mongodb.username = response.username;
+        database.mongodb.password = response.password;
       }
 
       onReadOnlyUserUpdated(database);
-      onContinue();
     } catch (e) {
       alert((e as Error).message);
     }
@@ -64,7 +103,7 @@ export const CreateReadOnlyComponent = ({
 
   const handleSkipConfirmed = () => {
     setShowSkipConfirmation(false);
-    onContinue();
+    onSkipped();
   };
 
   useEffect(() => {
@@ -73,7 +112,7 @@ export const CreateReadOnlyComponent = ({
 
       const isReadOnly = await checkReadOnlyUser();
       if (isReadOnly) {
-        onContinue();
+        onAlreadyExists();
       }
 
       setIsCheckingReadOnlyUser(false);
@@ -123,6 +162,31 @@ export const CreateReadOnlyComponent = ({
           <b>Read-only user allows to avoid storing credentials with write access at all</b>. Even
           in the worst case of hacking, nobody will be able to corrupt your data.
         </p>
+
+        <p className="mt-3">
+          {privileges.length === 0 ? (
+            <>
+              Current user has <b>no write {privilegesLabel}</b>.
+            </>
+          ) : (
+            <>
+              Current user has the following write {privilegesLabel}:{' '}
+              <span
+                className={shouldShowExpandToggle() ? 'cursor-pointer hover:opacity-80' : ''}
+                onClick={() =>
+                  shouldShowExpandToggle() && setIsPrivilegesExpanded(!isPrivilegesExpanded)
+                }
+              >
+                {getPrivilegesDisplay()}
+                {shouldShowExpandToggle() && (
+                  <span className="ml-1 text-xs text-blue-600 hover:opacity-80">
+                    ({isPrivilegesExpanded ? 'collapse' : 'expand'})
+                  </span>
+                )}
+              </span>
+            </>
+          )}
+        </p>
       </div>
 
       <div className="mt-5 flex">
@@ -130,9 +194,11 @@ export const CreateReadOnlyComponent = ({
           Back
         </Button>
 
-        <Button className="mr-2 ml-auto" danger ghost onClick={handleSkip}>
-          Skip
-        </Button>
+        {!IS_CLOUD && (
+          <Button className="mr-2 ml-auto" danger ghost onClick={handleSkip}>
+            Skip
+          </Button>
+        )}
 
         <Button
           type="primary"
@@ -166,7 +232,7 @@ export const CreateReadOnlyComponent = ({
         </div>
 
         <div className="flex justify-end">
-          <Button className="mr-2" danger onClick={handleSkipConfirmed}>
+          <Button className="mr-2" danger ghost onClick={handleSkipConfirmed}>
             Yes, I accept risks
           </Button>
 

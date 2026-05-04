@@ -2,7 +2,6 @@ package usecases_mongodb
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +14,9 @@ import (
 	"github.com/google/uuid"
 
 	"databasus-backend/internal/config"
+	common "databasus-backend/internal/features/backups/backups/common"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backup_encryption "databasus-backend/internal/features/backups/backups/encryption"
-	usecases_common "databasus-backend/internal/features/backups/backups/usecases/common"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	mongodbtypes "databasus-backend/internal/features/databases/databases/mongodb"
@@ -46,21 +46,17 @@ type writeResult struct {
 
 func (uc *CreateMongodbBackupUsecase) Execute(
 	ctx context.Context,
-	backupID uuid.UUID,
+	backup *backups_core.Backup,
 	backupConfig *backups_config.BackupConfig,
 	db *databases.Database,
 	storage *storages.Storage,
 	backupProgressListener func(completedMBs float64),
-) (*usecases_common.BackupMetadata, error) {
+) (*common.BackupMetadata, error) {
 	uc.logger.Info(
 		"Creating MongoDB backup via mongodump",
 		"databaseId", db.ID,
 		"storageId", storage.ID,
 	)
-
-	if !backupConfig.IsBackupsEnabled {
-		return nil, fmt.Errorf("backups are not enabled for this database: \"%s\"", db.Name)
-	}
 
 	mdb := db.Mongodb
 	if mdb == nil {
@@ -80,13 +76,9 @@ func (uc *CreateMongodbBackupUsecase) Execute(
 
 	return uc.streamToStorage(
 		ctx,
-		backupID,
+		backup,
 		backupConfig,
-		tools.GetMongodbExecutable(
-			tools.MongodbExecutableMongodump,
-			config.GetEnv().EnvMode,
-			config.GetEnv().MongodbInstallDir,
-		),
+		tools.GetMongodbExecutable(tools.MongodbExecutableMongodump),
 		args,
 		storage,
 		backupProgressListener,
@@ -118,13 +110,13 @@ func (uc *CreateMongodbBackupUsecase) buildMongodumpArgs(
 
 func (uc *CreateMongodbBackupUsecase) streamToStorage(
 	parentCtx context.Context,
-	backupID uuid.UUID,
+	backup *backups_core.Backup,
 	backupConfig *backups_config.BackupConfig,
 	mongodumpBin string,
 	args []string,
 	storage *storages.Storage,
 	backupProgressListener func(completedMBs float64),
-) (*usecases_common.BackupMetadata, error) {
+) (*common.BackupMetadata, error) {
 	uc.logger.Info("Streaming MongoDB backup to storage", "mongodumpBin", mongodumpBin)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
@@ -167,7 +159,7 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 	storageReader, storageWriter := io.Pipe()
 
 	finalWriter, encryptionWriter, backupMetadata, err := uc.setupBackupEncryption(
-		backupID,
+		backup.ID,
 		backupConfig,
 		storageWriter,
 	)
@@ -175,11 +167,17 @@ func (uc *CreateMongodbBackupUsecase) streamToStorage(
 		return nil, err
 	}
 
-	countingWriter := usecases_common.NewCountingWriter(finalWriter)
+	countingWriter := common.NewCountingWriter(finalWriter)
 
 	saveErrCh := make(chan error, 1)
 	go func() {
-		saveErr := storage.SaveFile(ctx, uc.fieldEncryptor, uc.logger, backupID, storageReader)
+		saveErr := storage.SaveFile(
+			ctx,
+			uc.fieldEncryptor,
+			uc.logger,
+			backup.FileName,
+			storageReader,
+		)
 		saveErrCh <- saveErr
 	}()
 
@@ -264,8 +262,9 @@ func (uc *CreateMongodbBackupUsecase) setupBackupEncryption(
 	backupID uuid.UUID,
 	backupConfig *backups_config.BackupConfig,
 	storageWriter io.WriteCloser,
-) (io.Writer, *backup_encryption.EncryptionWriter, usecases_common.BackupMetadata, error) {
-	backupMetadata := usecases_common.BackupMetadata{
+) (io.Writer, *backup_encryption.EncryptionWriter, common.BackupMetadata, error) {
+	backupMetadata := common.BackupMetadata{
+		BackupID:   backupID,
 		Encryption: backups_config.BackupEncryptionNone,
 	}
 
@@ -273,40 +272,21 @@ func (uc *CreateMongodbBackupUsecase) setupBackupEncryption(
 		return storageWriter, nil, backupMetadata, nil
 	}
 
-	salt, err := backup_encryption.GenerateSalt()
-	if err != nil {
-		return nil, nil, backupMetadata, fmt.Errorf("failed to generate salt: %w", err)
-	}
-
-	nonce, err := backup_encryption.GenerateNonce()
-	if err != nil {
-		return nil, nil, backupMetadata, fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
 	masterKey, err := uc.secretKeyService.GetSecretKey()
 	if err != nil {
 		return nil, nil, backupMetadata, fmt.Errorf("failed to get master key: %w", err)
 	}
 
-	encryptionWriter, err := backup_encryption.NewEncryptionWriter(
-		storageWriter,
-		masterKey,
-		backupID,
-		salt,
-		nonce,
-	)
+	encSetup, err := backup_encryption.SetupEncryptionWriter(storageWriter, masterKey, backupID)
 	if err != nil {
-		return nil, nil, backupMetadata, fmt.Errorf("failed to create encryption writer: %w", err)
+		return nil, nil, backupMetadata, err
 	}
 
-	saltBase64 := base64.StdEncoding.EncodeToString(salt)
-	nonceBase64 := base64.StdEncoding.EncodeToString(nonce)
-
 	backupMetadata.Encryption = backups_config.BackupEncryptionEncrypted
-	backupMetadata.EncryptionSalt = &saltBase64
-	backupMetadata.EncryptionIV = &nonceBase64
+	backupMetadata.EncryptionSalt = &encSetup.SaltBase64
+	backupMetadata.EncryptionIV = &encSetup.NonceBase64
 
-	return encryptionWriter, encryptionWriter, backupMetadata, nil
+	return encSetup.Writer, encSetup.Writer, backupMetadata, nil
 }
 
 func (uc *CreateMongodbBackupUsecase) copyWithShutdownCheck(

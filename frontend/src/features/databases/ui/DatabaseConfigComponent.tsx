@@ -1,12 +1,21 @@
-import { CloseOutlined, InfoCircleOutlined } from '@ant-design/icons';
+import {
+  ArrowRightOutlined,
+  CloseOutlined,
+  CopyOutlined,
+  DeleteOutlined,
+  InfoCircleOutlined,
+} from '@ant-design/icons';
 import { Button, Input } from 'antd';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
+import { backupConfigApi } from '../../../entity/backups';
 import { type Database, databaseApi } from '../../../entity/databases';
+import type { UserProfile } from '../../../entity/users';
 import { ToastHelper } from '../../../shared/toast';
 import { ConfirmationComponent } from '../../../shared/ui';
 import { EditBackupConfigComponent, ShowBackupConfigComponent } from '../../backups';
 import { EditHealthcheckConfigComponent, ShowHealthcheckConfigComponent } from '../../healthcheck';
+import { DatabaseTransferDialogComponent } from './DatabaseTransferDialogComponent';
 import { EditDatabaseNotifiersComponent } from './edit/EditDatabaseNotifiersComponent';
 import { EditDatabaseSpecificDataComponent } from './edit/EditDatabaseSpecificDataComponent';
 import { ShowDatabaseNotifiersComponent } from './show/ShowDatabaseNotifiersComponent';
@@ -14,6 +23,7 @@ import { ShowDatabaseSpecificDataComponent } from './show/ShowDatabaseSpecificDa
 
 interface Props {
   database: Database;
+  user: UserProfile;
   setDatabase: (database?: Database | undefined) => void;
   onDatabaseChanged: (database: Database) => void;
   onDatabaseDeleted: () => void;
@@ -25,6 +35,7 @@ interface Props {
 
 export const DatabaseConfigComponent = ({
   database,
+  user,
   setDatabase,
   onDatabaseChanged,
   onDatabaseDeleted,
@@ -46,6 +57,15 @@ export const DatabaseConfigComponent = ({
   const [isCopying, setIsCopying] = useState(false);
   const [isShowRemoveConfirm, setIsShowRemoveConfirm] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
+  const [isShowCopyConfirm, setIsShowCopyConfirm] = useState(false);
+  const [isShowTransferDialog, setIsShowTransferDialog] = useState(false);
+  const [currentStorageId, setCurrentStorageId] = useState<string | undefined>();
+
+  useEffect(() => {
+    backupConfigApi.getBackupConfigByDbID(database.id).then((config) => {
+      setCurrentStorageId(config.storage?.id);
+    });
+  }, [database.id]);
 
   const loadSettings = () => {
     setDatabase(undefined);
@@ -57,6 +77,7 @@ export const DatabaseConfigComponent = ({
     if (!database) return;
 
     setIsCopying(true);
+    setIsShowCopyConfirm(false);
 
     databaseApi
       .copyDatabase(database.id)
@@ -103,6 +124,7 @@ export const DatabaseConfigComponent = ({
   const remove = () => {
     if (!database) return;
 
+    setIsShowRemoveConfirm(false);
     setIsRemoving(true);
     databaseApi
       .deleteDatabase(database.id)
@@ -147,7 +169,18 @@ export const DatabaseConfigComponent = ({
   };
 
   return (
-    <div className="w-full rounded-tr-md rounded-br-md rounded-bl-md bg-white p-3 shadow sm:p-5 dark:bg-gray-800">
+    <div className="relative w-full rounded-tr-md rounded-br-md rounded-bl-md bg-white p-3 shadow sm:p-5 dark:bg-gray-800">
+      {isRemoving && (
+        <div className="absolute inset-0 z-10 flex items-center justify-center rounded-tr-md rounded-br-md rounded-bl-md bg-white/80 dark:bg-gray-800/80">
+          <div className="flex flex-col items-center gap-3">
+            <div className="h-8 w-8 animate-spin rounded-full border-4 border-gray-300 border-t-blue-500" />
+            <span className="text-sm font-medium text-gray-600 dark:text-gray-300">
+              Removing database...
+            </span>
+          </div>
+        </div>
+      )}
+
       {!isEditName ? (
         <div className="mb-5 flex items-center text-xl font-bold sm:text-2xl">
           {database.name}
@@ -281,6 +314,7 @@ export const DatabaseConfigComponent = ({
               {isEditBackupConfig ? (
                 <EditBackupConfigComponent
                   database={database}
+                  user={user}
                   isShowCancelButton
                   onCancel={() => {
                     setIsEditBackupConfig(false);
@@ -377,28 +411,48 @@ export const DatabaseConfigComponent = ({
             Test connection
           </Button>
 
-          <Button
-            type="primary"
-            className="w-full sm:mr-1 sm:w-auto"
-            onClick={copyDatabase}
-            loading={isCopying}
-            disabled={isCopying}
-          >
-            Copy
-          </Button>
+          {isCanManageDBs && (
+            <>
+              <Button
+                type="primary"
+                ghost
+                icon={<ArrowRightOutlined />}
+                onClick={() => setIsShowTransferDialog(true)}
+                className="sm:mr-1"
+              />
 
-          <Button
-            type="primary"
-            className="w-full sm:w-auto"
-            danger
-            onClick={() => setIsShowRemoveConfirm(true)}
-            ghost
-            loading={isRemoving}
-            disabled={isRemoving}
-          >
-            Remove
-          </Button>
+              <Button
+                type="primary"
+                ghost
+                icon={<CopyOutlined />}
+                onClick={() => setIsShowCopyConfirm(true)}
+                loading={isCopying}
+                disabled={isCopying}
+                className="sm:mr-1"
+              />
+
+              <Button
+                type="primary"
+                ghost
+                danger
+                icon={<DeleteOutlined />}
+                onClick={() => setIsShowRemoveConfirm(true)}
+                loading={isRemoving}
+                disabled={isRemoving}
+              />
+            </>
+          )}
         </div>
+      )}
+
+      {isShowCopyConfirm && (
+        <ConfirmationComponent
+          onConfirm={copyDatabase}
+          onDecline={() => setIsShowCopyConfirm(false)}
+          description="Are you sure you want to copy this database? A new database with the same settings will be created."
+          actionText="Copy"
+          actionButtonColor="blue"
+        />
       )}
 
       {isShowRemoveConfirm && (
@@ -408,6 +462,19 @@ export const DatabaseConfigComponent = ({
           description="Are you sure you want to remove this database? This action cannot be undone."
           actionText="Remove"
           actionButtonColor="red"
+        />
+      )}
+
+      {isShowTransferDialog && (
+        <DatabaseTransferDialogComponent
+          database={database}
+          user={user}
+          currentStorageId={currentStorageId}
+          onClose={() => setIsShowTransferDialog(false)}
+          onTransferred={() => {
+            setIsShowTransferDialog(false);
+            window.location.reload();
+          }}
         />
       )}
     </div>

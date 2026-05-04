@@ -2,6 +2,7 @@ package users_services
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,72 +21,91 @@ import (
 	"databasus-backend/internal/features/encryption/secrets"
 	users_dto "databasus-backend/internal/features/users/dto"
 	users_enums "databasus-backend/internal/features/users/enums"
+	users_errors "databasus-backend/internal/features/users/errors"
 	users_interfaces "databasus-backend/internal/features/users/interfaces"
 	users_models "databasus-backend/internal/features/users/models"
 	users_repositories "databasus-backend/internal/features/users/repositories"
 )
 
 type UserService struct {
-	userRepository   *users_repositories.UserRepository
-	secretKeyService *secrets.SecretKeyService
-	settingsService  *SettingsService
-	auditLogWriter   users_interfaces.AuditLogWriter
+	userRepository          *users_repositories.UserRepository
+	secretKeyService        *secrets.SecretKeyService
+	settingsService         *SettingsService
+	auditLogWriter          users_interfaces.AuditLogWriter
+	emailSender             users_interfaces.EmailSender
+	passwordResetRepository *users_repositories.PasswordResetRepository
 }
 
 func (s *UserService) SetAuditLogWriter(writer users_interfaces.AuditLogWriter) {
 	s.auditLogWriter = writer
 }
 
-func (s *UserService) SignUp(request *users_dto.SignUpRequestDTO) error {
+func (s *UserService) SetEmailSender(sender users_interfaces.EmailSender) {
+	s.emailSender = sender
+}
+
+func (s *UserService) SignUp(request *users_dto.SignUpRequestDTO) (*users_models.User, error) {
 	existingUser, err := s.userRepository.GetUserByEmail(request.Email)
 	if err != nil {
-		return fmt.Errorf("failed to check existing user: %w", err)
+		return nil, fmt.Errorf("failed to check existing user: %w", err)
 	}
 
 	if existingUser != nil && existingUser.Status != users_enums.UserStatusInvited {
-		return errors.New("user with this email already exists")
+		return nil, errors.New("user with this email already exists")
 	}
 
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(request.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return fmt.Errorf("failed to hash password: %w", err)
+		return nil, fmt.Errorf("failed to hash password: %w", err)
 	}
 
 	hashedPasswordStr := string(hashedPassword)
 
 	// If user exists with INVITED status, activate them and set password
 	if existingUser != nil && existingUser.Status == users_enums.UserStatusInvited {
-		if err := s.userRepository.UpdateUserPassword(existingUser.ID, hashedPasswordStr); err != nil {
-			return fmt.Errorf("failed to set password: %w", err)
+		if err := s.userRepository.UpdateUserPassword(
+			existingUser.ID,
+			hashedPasswordStr,
+		); err != nil {
+			return nil, fmt.Errorf("failed to set password: %w", err)
 		}
 
-		if err := s.userRepository.UpdateUserStatus(existingUser.ID, users_enums.UserStatusActive); err != nil {
-			return fmt.Errorf("failed to activate user: %w", err)
+		if err := s.userRepository.UpdateUserStatus(
+			existingUser.ID,
+			users_enums.UserStatusActive,
+		); err != nil {
+			return nil, fmt.Errorf("failed to activate user: %w", err)
 		}
 
 		name := request.Name
 		if err := s.userRepository.UpdateUserInfo(existingUser.ID, &name, nil); err != nil {
-			return fmt.Errorf("failed to update name: %w", err)
+			return nil, fmt.Errorf("failed to update name: %w", err)
+		}
+
+		// Fetch updated user to ensure we have the latest data
+		updatedUser, err := s.userRepository.GetUserByID(existingUser.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get updated user: %w", err)
 		}
 
 		s.auditLogWriter.WriteAuditLog(
-			fmt.Sprintf("Invited user completed registration: %s", existingUser.Email),
-			&existingUser.ID,
+			fmt.Sprintf("Invited user completed registration: %s", updatedUser.Email),
+			&updatedUser.ID,
 			nil,
 		)
 
-		return nil
+		return updatedUser, nil
 	}
 
 	// Get settings to check registration policy for new users
 	settings, err := s.settingsService.GetSettings()
 	if err != nil {
-		return fmt.Errorf("failed to get settings: %w", err)
+		return nil, fmt.Errorf("failed to get settings: %w", err)
 	}
 
 	// Check if external registrations are allowed
 	if !settings.IsAllowExternalRegistrations {
-		return errors.New("external registration is disabled")
+		return nil, errors.New("external registration is disabled")
 	}
 
 	user := &users_models.User{
@@ -100,7 +120,7 @@ func (s *UserService) SignUp(request *users_dto.SignUpRequestDTO) error {
 	}
 
 	if err := s.userRepository.CreateUser(user); err != nil {
-		return fmt.Errorf("failed to create user: %w", err)
+		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 
 	s.auditLogWriter.WriteAuditLog(
@@ -109,7 +129,7 @@ func (s *UserService) SignUp(request *users_dto.SignUpRequestDTO) error {
 		nil,
 	)
 
-	return nil
+	return user, nil
 }
 
 func (s *UserService) SignIn(
@@ -174,7 +194,6 @@ func (s *UserService) GetUserFromToken(token string) (*users_models.User, error)
 		}
 		return []byte(secretKey), nil
 	})
-
 	if err != nil {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
@@ -244,6 +263,7 @@ func (s *UserService) GenerateAccessToken(
 
 	return &users_dto.SignInResponseDTO{
 		UserID: user.ID,
+		Email:  user.Email,
 		Token:  tokenString,
 	}, nil
 }
@@ -254,7 +274,6 @@ func (s *UserService) CreateInitialAdmin() error {
 
 func (s *UserService) IsRootAdminHasPassword() (bool, error) {
 	admin, err := s.userRepository.GetUserByEmail("admin")
-
 	if err != nil {
 		return false, fmt.Errorf("failed to get admin user: %w", err)
 	}
@@ -300,7 +319,7 @@ func (s *UserService) SetRootAdminPassword(password string) error {
 	return nil
 }
 
-func (s *UserService) ChangeUserPasswordByEmail(email string, newPassword string) error {
+func (s *UserService) ChangeUserPasswordByEmail(email, newPassword string) error {
 	user, err := s.userRepository.GetUserByEmail(email)
 	if err != nil {
 		return fmt.Errorf("failed to get user: %w", err)
@@ -340,7 +359,7 @@ func (s *UserService) InviteUser(
 
 	// Check if user has permission to invite
 	if !invitedBy.CanInviteUsers(settings) {
-		return nil, errors.New("insufficient permissions to invite users")
+		return nil, users_errors.ErrInsufficientPermissionsToInviteUsers
 	}
 
 	// Check if user already exists
@@ -369,7 +388,7 @@ func (s *UserService) InviteUser(
 
 	message := fmt.Sprintf("User invited: %s", request.Email)
 	if request.IntendedWorkspaceID != nil {
-		message += fmt.Sprintf(" for workspace %s", request.IntendedWorkspaceID.String())
+		message += " for workspace"
 	}
 	s.auditLogWriter.WriteAuditLog(
 		message,
@@ -416,6 +435,9 @@ func (s *UserService) UpdateUserInfo(
 		return fmt.Errorf("failed to get user: %w", err)
 	}
 
+	oldEmail := user.Email
+	oldName := user.Name
+
 	if user.Email == "admin" && request.Email != nil && *request.Email != user.Email {
 		return errors.New("admin email cannot be changed")
 	}
@@ -434,7 +456,28 @@ func (s *UserService) UpdateUserInfo(
 		return fmt.Errorf("failed to update user info: %w", err)
 	}
 
-	s.auditLogWriter.WriteAuditLog("User info updated", &userID, nil)
+	var auditMessages []string
+	if request.Email != nil && *request.Email != oldEmail {
+		auditMessages = append(
+			auditMessages,
+			fmt.Sprintf("Email changed from '%s' to '%s'", oldEmail, *request.Email),
+		)
+	}
+	if request.Name != nil && *request.Name != oldName {
+		auditMessages = append(
+			auditMessages,
+			fmt.Sprintf("Name changed from '%s' to '%s'", oldName, *request.Name),
+		)
+	}
+
+	if len(auditMessages) > 0 {
+		for _, message := range auditMessages {
+			s.auditLogWriter.WriteAuditLog(message, &userID, nil)
+		}
+	} else {
+		s.auditLogWriter.WriteAuditLog("User info updated", &userID, nil)
+	}
+
 	return nil
 }
 
@@ -447,6 +490,178 @@ func (s *UserService) HandleGitHubOAuth(
 		github.Endpoint,
 		"https://api.github.com/user",
 	)
+}
+
+func (s *UserService) HandleGoogleOAuth(
+	code, redirectUri string,
+) (*users_dto.OAuthCallbackResponseDTO, error) {
+	return s.handleGoogleOAuthWithEndpoint(
+		code,
+		redirectUri,
+		google.Endpoint,
+		"https://www.googleapis.com/oauth2/v2/userinfo",
+	)
+}
+
+func (s *UserService) SendResetPasswordCode(email string) error {
+	user, err := s.userRepository.GetUserByEmail(email)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Silently succeed for non-existent users to prevent enumeration attacks
+	if user == nil {
+		return nil
+	}
+
+	// Only active users can reset passwords
+	if user.Status != users_enums.UserStatusActive {
+		return errors.New("only active users can reset their password")
+	}
+
+	// Check rate limiting - max 3 codes per hour
+	oneHourAgo := time.Now().UTC().Add(-1 * time.Hour)
+	recentCount, err := s.passwordResetRepository.CountRecentCodesByUserID(user.ID, oneHourAgo)
+	if err != nil {
+		return fmt.Errorf("failed to check rate limit: %w", err)
+	}
+
+	if recentCount >= 3 {
+		return errors.New("too many password reset attempts, please try again later")
+	}
+
+	// Generate 6-digit random code using crypto/rand for better randomness
+	codeNum := make([]byte, 4)
+	_, err = io.ReadFull(rand.Reader, codeNum)
+	if err != nil {
+		return fmt.Errorf("failed to generate random code: %w", err)
+	}
+
+	// Convert bytes to uint32 and modulo to get 6 digits
+	randomInt := uint32(
+		codeNum[0],
+	)<<24 | uint32(
+		codeNum[1],
+	)<<16 | uint32(
+		codeNum[2],
+	)<<8 | uint32(
+		codeNum[3],
+	)
+	code := fmt.Sprintf("%06d", randomInt%1000000)
+
+	// Hash the code
+	hashedCode, err := bcrypt.GenerateFromPassword([]byte(code), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash code: %w", err)
+	}
+
+	// Store in database with 1 hour expiration
+	resetCode := &users_models.PasswordResetCode{
+		ID:         uuid.New(),
+		UserID:     user.ID,
+		HashedCode: string(hashedCode),
+		ExpiresAt:  time.Now().UTC().Add(1 * time.Hour),
+		IsUsed:     false,
+		CreatedAt:  time.Now().UTC(),
+	}
+
+	if err := s.passwordResetRepository.CreateResetCode(resetCode); err != nil {
+		return fmt.Errorf("failed to create reset code: %w", err)
+	}
+
+	// Send email with code
+	if s.emailSender != nil {
+		subject := "Password Reset Code"
+		body := fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+    <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 20px;">
+        <h2 style="color: #333333; margin-bottom: 20px;">Password Reset Request</h2>
+        <p style="color: #666666; line-height: 1.6; margin-bottom: 20px;">
+            You have requested to reset your password. Please use the following code to complete the password reset process:
+        </p>
+        <div style="background-color: #f8f9fa; border: 2px solid #e9ecef; border-radius: 8px; padding: 20px; text-align: center; margin: 30px 0;">
+            <h1 style="color: #2c3e50; font-size: 36px; margin: 0; letter-spacing: 8px; font-family: monospace;">%s</h1>
+        </div>
+        <p style="color: #666666; line-height: 1.6; margin-bottom: 20px;">
+            This code will expire in <strong>1 hour</strong>.
+        </p>
+        <p style="color: #666666; line-height: 1.6; margin-bottom: 20px;">
+            If you did not request a password reset, please ignore this email. Your password will remain unchanged.
+        </p>
+        <hr style="border: none; border-top: 1px solid #e9ecef; margin: 30px 0;">
+        <p style="color: #999999; font-size: 12px; line-height: 1.6;">
+            This is an automated message. Please do not reply to this email.
+        </p>
+    </div>
+</body>
+</html>
+`, code)
+
+		if err := s.emailSender.SendEmail(user.Email, subject, body); err != nil {
+			return fmt.Errorf("failed to send email: %w", err)
+		}
+	}
+
+	// Audit log
+	if s.auditLogWriter != nil {
+		s.auditLogWriter.WriteAuditLog(
+			fmt.Sprintf("Password reset code sent to: %s", user.Email),
+			&user.ID,
+			nil,
+		)
+	}
+
+	return nil
+}
+
+func (s *UserService) ResetPassword(email, code, newPassword string) error {
+	user, err := s.userRepository.GetUserByEmail(email)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	if user == nil {
+		return errors.New("user with this email does not exist")
+	}
+
+	// Get valid reset code for user
+	resetCode, err := s.passwordResetRepository.GetValidCodeByUserID(user.ID)
+	if err != nil {
+		return errors.New("invalid or expired reset code")
+	}
+
+	// Verify code matches
+	err = bcrypt.CompareHashAndPassword([]byte(resetCode.HashedCode), []byte(code))
+	if err != nil {
+		return errors.New("invalid reset code")
+	}
+
+	// Mark code as used
+	if err := s.passwordResetRepository.MarkCodeAsUsed(resetCode.ID); err != nil {
+		return fmt.Errorf("failed to mark code as used: %w", err)
+	}
+
+	// Update user password
+	if err := s.ChangeUserPassword(user.ID, newPassword); err != nil {
+		return fmt.Errorf("failed to update password: %w", err)
+	}
+
+	// Audit log
+	if s.auditLogWriter != nil {
+		s.auditLogWriter.WriteAuditLog(
+			"Password reset via email code",
+			&user.ID,
+			nil,
+		)
+	}
+
+	return nil
 }
 
 func (s *UserService) handleGitHubOAuthWithEndpoint(
@@ -470,7 +685,11 @@ func (s *UserService) handleGitHubOAuthWithEndpoint(
 	}
 
 	client := oauthConfig.Client(context.Background(), token)
-	resp, err := client.Get(userAPIURL)
+	githubReq, err := http.NewRequestWithContext(context.Background(), "GET", userAPIURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user info request: %w", err)
+	}
+	resp, err := client.Do(githubReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user info: %w", err)
 	}
@@ -515,17 +734,6 @@ func (s *UserService) handleGitHubOAuthWithEndpoint(
 	return s.getOrCreateUserFromOAuth(oauthID, email, name, "github")
 }
 
-func (s *UserService) HandleGoogleOAuth(
-	code, redirectUri string,
-) (*users_dto.OAuthCallbackResponseDTO, error) {
-	return s.handleGoogleOAuthWithEndpoint(
-		code,
-		redirectUri,
-		google.Endpoint,
-		"https://www.googleapis.com/oauth2/v2/userinfo",
-	)
-}
-
 func (s *UserService) handleGoogleOAuthWithEndpoint(
 	code, redirectUri string,
 	endpoint oauth2.Endpoint,
@@ -550,7 +758,11 @@ func (s *UserService) handleGoogleOAuthWithEndpoint(
 	}
 
 	client := oauthConfig.Client(context.Background(), token)
-	resp, err := client.Get(userAPIURL)
+	googleReq, err := http.NewRequestWithContext(context.Background(), "GET", userAPIURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create user info request: %w", err)
+	}
+	resp, err := client.Do(googleReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user info: %w", err)
 	}
@@ -634,7 +846,10 @@ func (s *UserService) getOrCreateUserFromOAuth(
 
 	if userByEmail != nil {
 		if userByEmail.Status == users_enums.UserStatusInvited {
-			if err := s.userRepository.UpdateUserStatus(userByEmail.ID, users_enums.UserStatusActive); err != nil {
+			if err := s.userRepository.UpdateUserStatus(
+				userByEmail.ID,
+				users_enums.UserStatusActive,
+			); err != nil {
 				return nil, fmt.Errorf("failed to activate user: %w", err)
 			}
 
@@ -743,7 +958,11 @@ func (s *UserService) fetchGitHubPrimaryEmail(
 		emailsURL = baseURL + "/user/emails"
 	}
 
-	resp, err := client.Get(emailsURL)
+	emailsReq, err := http.NewRequestWithContext(context.Background(), "GET", emailsURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create user emails request: %w", err)
+	}
+	resp, err := client.Do(emailsReq)
 	if err != nil {
 		return "", fmt.Errorf("failed to get user emails: %w", err)
 	}

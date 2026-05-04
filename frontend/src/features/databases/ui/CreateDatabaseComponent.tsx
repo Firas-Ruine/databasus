@@ -8,9 +8,11 @@ import {
   type MongodbDatabase,
   type MysqlDatabase,
   Period,
+  PostgresBackupType,
   type PostgresqlDatabase,
   databaseApi,
 } from '../../../entity/databases';
+import type { UserProfile } from '../../../entity/users';
 import { EditBackupConfigComponent } from '../../backups';
 import { CreateReadOnlyComponent } from './edit/CreateReadOnlyComponent';
 import { EditDatabaseBaseInfoComponent } from './edit/EditDatabaseBaseInfoComponent';
@@ -18,8 +20,8 @@ import { EditDatabaseNotifiersComponent } from './edit/EditDatabaseNotifiersComp
 import { EditDatabaseSpecificDataComponent } from './edit/EditDatabaseSpecificDataComponent';
 
 interface Props {
+  user: UserProfile;
   workspaceId: string;
-
   onCreated: (databaseId: string) => void;
   onClose: () => void;
 }
@@ -37,6 +39,8 @@ const createInitialDatabase = (workspaceId: string): Database =>
 
     notifiers: [],
     sendNotificationsOn: [],
+
+    isAgentTokenGenerated: false,
   }) as Database;
 
 const initializeDatabaseTypeData = (db: Database): Database => {
@@ -50,7 +54,15 @@ const initializeDatabaseTypeData = (db: Database): Database => {
 
   switch (db.type) {
     case DatabaseType.POSTGRES:
-      return { ...base, postgresql: db.postgresql ?? ({ cpuCount: 1 } as PostgresqlDatabase) };
+      return {
+        ...base,
+        postgresql:
+          db.postgresql ??
+          ({
+            cpuCount: 1,
+            backupType: PostgresBackupType.PG_DUMP,
+          } as PostgresqlDatabase),
+      };
     case DatabaseType.MYSQL:
       return { ...base, mysql: db.mysql ?? ({} as MysqlDatabase) };
     case DatabaseType.MARIADB:
@@ -62,7 +74,7 @@ const initializeDatabaseTypeData = (db: Database): Database => {
   }
 };
 
-export const CreateDatabaseComponent = ({ workspaceId, onCreated, onClose }: Props) => {
+export const CreateDatabaseComponent = ({ user, workspaceId, onCreated, onClose }: Props) => {
   const [isCreating, setIsCreating] = useState(false);
   const [backupConfig, setBackupConfig] = useState<BackupConfig | undefined>();
   const [database, setDatabase] = useState<Database>(createInitialDatabase(workspaceId));
@@ -80,7 +92,11 @@ export const CreateDatabaseComponent = ({ workspaceId, onCreated, onClose }: Pro
 
       backupConfig.databaseId = createdDatabase.id;
       await backupConfigApi.saveBackupConfig(backupConfig);
-      if (backupConfig.isBackupsEnabled) {
+
+      if (
+        backupConfig.isBackupsEnabled &&
+        createdDatabase.postgresql?.backupType !== PostgresBackupType.WAL_V1
+      ) {
         await backupsApi.makeBackup(createdDatabase.id);
       }
 
@@ -125,7 +141,12 @@ export const CreateDatabaseComponent = ({ workspaceId, onCreated, onClose }: Pro
         isSaveToApi={false}
         onSaved={(database) => {
           setDatabase({ ...database });
-          setStep('create-readonly-user');
+
+          const isWalBackup =
+            database.type === DatabaseType.POSTGRES &&
+            database.postgresql?.backupType === PostgresBackupType.WAL_V1;
+
+          setStep(isWalBackup ? 'backup-config' : 'create-readonly-user');
         }}
       />
     );
@@ -137,9 +158,11 @@ export const CreateDatabaseComponent = ({ workspaceId, onCreated, onClose }: Pro
         database={database}
         onReadOnlyUserUpdated={(database) => {
           setDatabase({ ...database });
+          setStep('backup-config');
         }}
         onGoBack={() => setStep('db-settings')}
-        onContinue={() => setStep('backup-config')}
+        onSkipped={() => setStep('backup-config')}
+        onAlreadyExists={() => setStep('backup-config')}
       />
     );
   }
@@ -147,6 +170,7 @@ export const CreateDatabaseComponent = ({ workspaceId, onCreated, onClose }: Pro
   if (step === 'backup-config') {
     return (
       <EditBackupConfigComponent
+        user={user}
         database={database}
         isShowCancelButton={false}
         onCancel={() => onClose()}
@@ -163,6 +187,10 @@ export const CreateDatabaseComponent = ({ workspaceId, onCreated, onClose }: Pro
   }
 
   if (step === 'notifiers') {
+    if (isCreating) {
+      return <div>Creating database...</div>;
+    }
+
     return (
       <EditDatabaseNotifiersComponent
         database={database}

@@ -1,6 +1,5 @@
 import { Button, Input } from 'antd';
 
-import { GOOGLE_DRIVE_OAUTH_REDIRECT_URL } from '../../../../../constants';
 import type { Storage } from '../../../../../entity/storages';
 import type { StorageOauthDto } from '../../../../../entity/storages/models/StorageOauthDto';
 
@@ -16,13 +15,11 @@ export function EditGoogleDriveStorageComponent({ storage, setStorage, setUnsave
       return;
     }
 
-    const redirectUri = GOOGLE_DRIVE_OAUTH_REDIRECT_URL;
+    const redirectUri = `${window.location.origin}/storages/google-oauth`;
     const clientId = storage.googleDriveStorage.clientId;
     const scope = 'https://www.googleapis.com/auth/drive.file';
-    const originUrl = `${window.location.origin}/storages/google-oauth`;
 
     const oauthDto: StorageOauthDto = {
-      redirectUrl: originUrl,
       storage: storage,
       authCode: '',
     };

@@ -1,4 +1,9 @@
-import { CloseOutlined, InfoCircleOutlined } from '@ant-design/icons';
+import {
+  ArrowRightOutlined,
+  CloseOutlined,
+  DeleteOutlined,
+  InfoCircleOutlined,
+} from '@ant-design/icons';
 import { Button, Input, Spin } from 'antd';
 import { useState } from 'react';
 import { useEffect } from 'react';
@@ -6,8 +11,10 @@ import { useEffect } from 'react';
 import { backupConfigApi } from '../../../entity/backups';
 import { storageApi } from '../../../entity/storages';
 import type { Storage } from '../../../entity/storages';
+import { type UserProfile, UserRole } from '../../../entity/users';
 import { ToastHelper } from '../../../shared/toast';
 import { ConfirmationComponent } from '../../../shared/ui';
+import { StorageTransferDialogComponent } from './StorageTransferDialogComponent';
 import { EditStorageComponent } from './edit/EditStorageComponent';
 import { ShowStorageComponent } from './show/ShowStorageComponent';
 
@@ -15,14 +22,18 @@ interface Props {
   storageId: string;
   onStorageChanged: (storage: Storage) => void;
   onStorageDeleted: () => void;
+  onStorageTransferred: () => void;
   isCanManageStorages: boolean;
+  user: UserProfile;
 }
 
 export const StorageComponent = ({
   storageId,
   onStorageChanged,
   onStorageDeleted,
+  onStorageTransferred,
   isCanManageStorages,
+  user,
 }: Props) => {
   const [storage, setStorage] = useState<Storage | undefined>();
 
@@ -37,6 +48,8 @@ export const StorageComponent = ({
 
   const [isShowRemoveConfirm, setIsShowRemoveConfirm] = useState(false);
   const [isRemoving, setIsRemoving] = useState(false);
+
+  const [isShowTransferDialog, setIsShowTransferDialog] = useState(false);
 
   const testConnection = () => {
     if (!storage) return;
@@ -130,14 +143,22 @@ export const StorageComponent = ({
         ) : (
           <div>
             {!isEditName ? (
-              <div className="mb-5 flex items-center text-2xl font-bold">
-                {storage.name}
-                {isCanManageStorages && (
-                  <div className="ml-2 cursor-pointer" onClick={() => startEdit('name')}>
-                    <img src="/icons/pen-gray.svg" />
-                  </div>
+              <>
+                <div className="mb-5 flex items-center text-2xl font-bold">
+                  {storage.name}
+                  {(!storage.isSystem || user.role === UserRole.ADMIN) && isCanManageStorages && (
+                    <div className="ml-2 cursor-pointer" onClick={() => startEdit('name')}>
+                      <img src="/icons/pen-gray.svg" />
+                    </div>
+                  )}
+                </div>
+
+                {storage.isSystem && (
+                  <span className="mt-2 inline-block rounded-xl bg-[#00000010] px-2 py-1 text-xs text-gray-700 dark:bg-[#ffffff10] dark:text-gray-300">
+                    System storage
+                  </span>
                 )}
-              </div>
+              </>
             ) : (
               <div>
                 <div className="flex items-center">
@@ -206,17 +227,22 @@ export const StorageComponent = ({
               </div>
             )}
 
-            <div className="mt-5 flex items-center font-bold">
-              <div>Storage settings</div>
+            {(!storage.isSystem || user.role === UserRole.ADMIN) && (
+              <div className="mt-5 flex items-center font-bold">
+                <div>Storage settings</div>
 
-              {!isEditSettings && isCanManageStorages ? (
-                <div className="ml-2 h-4 w-4 cursor-pointer" onClick={() => startEdit('settings')}>
-                  <img src="/icons/pen-gray.svg" />
-                </div>
-              ) : (
-                <div />
-              )}
-            </div>
+                {!isEditSettings && isCanManageStorages ? (
+                  <div
+                    className="ml-2 h-4 w-4 cursor-pointer"
+                    onClick={() => startEdit('settings')}
+                  >
+                    <img src="/icons/pen-gray.svg" />
+                  </div>
+                ) : (
+                  <div />
+                )}
+              </div>
+            )}
 
             <div className="mt-1 text-sm">
               {isEditSettings && isCanManageStorages ? (
@@ -231,13 +257,14 @@ export const StorageComponent = ({
                   isShowName={false}
                   editingStorage={storage}
                   onChanged={onStorageChanged}
+                  user={user}
                 />
               ) : (
-                <ShowStorageComponent storage={storage} />
+                <ShowStorageComponent storage={storage} user={user} />
               )}
             </div>
 
-            {!isEditSettings && (
+            {!isEditSettings && (!storage.isSystem || user.role === UserRole.ADMIN) && (
               <div className="mt-5">
                 <Button
                   type="primary"
@@ -250,16 +277,29 @@ export const StorageComponent = ({
                 </Button>
 
                 {isCanManageStorages && (
-                  <Button
-                    type="primary"
-                    danger
-                    onClick={() => setIsShowRemoveConfirm(true)}
-                    ghost
-                    loading={isRemoving}
-                    disabled={isRemoving}
-                  >
-                    Remove
-                  </Button>
+                  <>
+                    {!storage.isSystem && (
+                      <Button
+                        type="primary"
+                        ghost
+                        icon={<ArrowRightOutlined />}
+                        onClick={() => setIsShowTransferDialog(true)}
+                        className="mr-1"
+                      />
+                    )}
+
+                    {!(storage.isSystem && user.role !== UserRole.ADMIN) && (
+                      <Button
+                        type="primary"
+                        ghost
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => setIsShowRemoveConfirm(true)}
+                        loading={isRemoving}
+                        disabled={isRemoving}
+                      />
+                    )}
+                  </>
                 )}
               </div>
             )}
@@ -276,6 +316,17 @@ export const StorageComponent = ({
           />
         )}
       </div>
+
+      {isShowTransferDialog && storage && (
+        <StorageTransferDialogComponent
+          storage={storage}
+          onClose={() => setIsShowTransferDialog(false)}
+          onTransferred={() => {
+            setIsShowTransferDialog(false);
+            onStorageTransferred();
+          }}
+        />
+      )}
     </div>
   );
 };

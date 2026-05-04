@@ -2,7 +2,6 @@ package usecases_postgresql
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -14,9 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"databasus-backend/internal/config"
+	common "databasus-backend/internal/features/backups/backups/common"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backup_encryption "databasus-backend/internal/features/backups/backups/encryption"
-	usecases_common "databasus-backend/internal/features/backups/backups/usecases/common"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	pgtypes "databasus-backend/internal/features/databases/databases/postgresql"
@@ -24,8 +26,6 @@ import (
 	"databasus-backend/internal/features/storages"
 	"databasus-backend/internal/util/encryption"
 	"databasus-backend/internal/util/tools"
-
-	"github.com/google/uuid"
 )
 
 const (
@@ -53,14 +53,14 @@ type writeResult struct {
 
 func (uc *CreatePostgresqlBackupUsecase) Execute(
 	ctx context.Context,
-	backupID uuid.UUID,
+	backup *backups_core.Backup,
 	backupConfig *backups_config.BackupConfig,
 	db *databases.Database,
 	storage *storages.Storage,
 	backupProgressListener func(
 		completedMBs float64,
 	),
-) (*usecases_common.BackupMetadata, error) {
+) (*common.BackupMetadata, error) {
 	uc.logger.Info(
 		"Creating PostgreSQL backup via pg_dump custom format",
 		"databaseId",
@@ -68,10 +68,6 @@ func (uc *CreatePostgresqlBackupUsecase) Execute(
 		"storageId",
 		storage.ID,
 	)
-
-	if !backupConfig.IsBackupsEnabled {
-		return nil, fmt.Errorf("backups are not enabled for this database: \"%s\"", db.Name)
-	}
 
 	pg := db.Postgresql
 
@@ -92,14 +88,9 @@ func (uc *CreatePostgresqlBackupUsecase) Execute(
 
 	return uc.streamToStorage(
 		ctx,
-		backupID,
+		backup,
 		backupConfig,
-		tools.GetPostgresqlExecutable(
-			pg.Version,
-			"pg_dump",
-			config.GetEnv().EnvMode,
-			config.GetEnv().PostgresesInstallDir,
-		),
+		tools.GetPostgresqlExecutable(pg.Version, "pg_dump"),
 		args,
 		decryptedPassword,
 		storage,
@@ -111,7 +102,7 @@ func (uc *CreatePostgresqlBackupUsecase) Execute(
 // streamToStorage streams pg_dump output directly to storage
 func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	parentCtx context.Context,
-	backupID uuid.UUID,
+	backup *backups_core.Backup,
 	backupConfig *backups_config.BackupConfig,
 	pgBin string,
 	args []string,
@@ -119,7 +110,7 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	storage *storages.Storage,
 	db *databases.Database,
 	backupProgressListener func(completedMBs float64),
-) (*usecases_common.BackupMetadata, error) {
+) (*common.BackupMetadata, error) {
 	uc.logger.Info("Streaming PostgreSQL backup to storage", "pgBin", pgBin, "args", args)
 
 	ctx, cancel := uc.createBackupContext(parentCtx)
@@ -139,7 +130,14 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	cmd := exec.CommandContext(ctx, pgBin, args...)
 	uc.logger.Info("Executing PostgreSQL backup command", "command", cmd.String())
 
-	if err := uc.setupPgEnvironment(cmd, pgpassFile, db.Postgresql.IsHttps, password, db.Postgresql.CpuCount, pgBin); err != nil {
+	if err := uc.setupPgEnvironment(
+		cmd,
+		pgpassFile,
+		db.Postgresql.IsHttps,
+		password,
+		db.Postgresql.CpuCount,
+		pgBin,
+	); err != nil {
 		return nil, err
 	}
 
@@ -163,7 +161,7 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	storageReader, storageWriter := io.Pipe()
 
 	finalWriter, encryptionWriter, backupMetadata, err := uc.setupBackupEncryption(
-		backupID,
+		backup.ID,
 		backupConfig,
 		storageWriter,
 	)
@@ -171,14 +169,20 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 		return nil, err
 	}
 
-	countingWriter := usecases_common.NewCountingWriter(finalWriter)
+	countingWriter := common.NewCountingWriter(finalWriter)
 
 	// The backup ID becomes the object key / filename in storage
 
 	// Start streaming into storage in its own goroutine
 	saveErrCh := make(chan error, 1)
 	go func() {
-		saveErr := storage.SaveFile(ctx, uc.fieldEncryptor, uc.logger, backupID, storageReader)
+		saveErr := storage.SaveFile(
+			ctx,
+			uc.fieldEncryptor,
+			uc.logger,
+			backup.FileName,
+			storageReader,
+		)
 		saveErrCh <- saveErr
 	}()
 
@@ -335,11 +339,6 @@ func (uc *CreatePostgresqlBackupUsecase) buildPgDumpArgs(pg *pgtypes.PostgresqlD
 		"--verbose",
 	}
 
-	// Add parallel jobs based on CPU count
-	if pg.CpuCount > 1 {
-		args = append(args, "-j", strconv.Itoa(pg.CpuCount))
-	}
-
 	for _, schema := range pg.IncludeSchemas {
 		args = append(args, "-n", schema)
 	}
@@ -476,8 +475,10 @@ func (uc *CreatePostgresqlBackupUsecase) setupBackupEncryption(
 	backupID uuid.UUID,
 	backupConfig *backups_config.BackupConfig,
 	storageWriter io.WriteCloser,
-) (io.Writer, *backup_encryption.EncryptionWriter, usecases_common.BackupMetadata, error) {
-	metadata := usecases_common.BackupMetadata{}
+) (io.Writer, *backup_encryption.EncryptionWriter, common.BackupMetadata, error) {
+	metadata := common.BackupMetadata{
+		BackupID: backupID,
+	}
 
 	if backupConfig.Encryption != backups_config.BackupEncryptionEncrypted {
 		metadata.Encryption = backups_config.BackupEncryptionNone
@@ -485,40 +486,22 @@ func (uc *CreatePostgresqlBackupUsecase) setupBackupEncryption(
 		return storageWriter, nil, metadata, nil
 	}
 
-	salt, err := backup_encryption.GenerateSalt()
-	if err != nil {
-		return nil, nil, metadata, fmt.Errorf("failed to generate salt: %w", err)
-	}
-
-	nonce, err := backup_encryption.GenerateNonce()
-	if err != nil {
-		return nil, nil, metadata, fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
 	masterKey, err := uc.secretKeyService.GetSecretKey()
 	if err != nil {
 		return nil, nil, metadata, fmt.Errorf("failed to get master key: %w", err)
 	}
 
-	encWriter, err := backup_encryption.NewEncryptionWriter(
-		storageWriter,
-		masterKey,
-		backupID,
-		salt,
-		nonce,
-	)
+	encSetup, err := backup_encryption.SetupEncryptionWriter(storageWriter, masterKey, backupID)
 	if err != nil {
-		return nil, nil, metadata, fmt.Errorf("failed to create encrypting writer: %w", err)
+		return nil, nil, metadata, err
 	}
 
-	saltBase64 := base64.StdEncoding.EncodeToString(salt)
-	nonceBase64 := base64.StdEncoding.EncodeToString(nonce)
-	metadata.EncryptionSalt = &saltBase64
-	metadata.EncryptionIV = &nonceBase64
+	metadata.EncryptionSalt = &encSetup.SaltBase64
+	metadata.EncryptionIV = &encSetup.NonceBase64
 	metadata.Encryption = backups_config.BackupEncryptionEncrypted
 
 	uc.logger.Info("Encryption enabled for backup", "backupId", backupID)
-	return encWriter, encWriter, metadata, nil
+	return encSetup.Writer, encSetup.Writer, metadata, nil
 }
 
 func (uc *CreatePostgresqlBackupUsecase) cleanupOnCancellation(
@@ -607,8 +590,8 @@ func (uc *CreatePostgresqlBackupUsecase) buildPgDumpErrorMessage(
 	stderrStr := string(stderrOutput)
 	errorMsg := fmt.Sprintf("%s failed: %v – stderr: %s", filepath.Base(pgBin), waitErr, stderrStr)
 
-	exitErr, ok := waitErr.(*exec.ExitError)
-	if !ok {
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
 		return errors.New(errorMsg)
 	}
 
@@ -759,14 +742,22 @@ func (uc *CreatePostgresqlBackupUsecase) createTempPgpassFile(
 		escapedPassword,
 	)
 
-	tempDir, err := os.MkdirTemp("", "pgpass")
+	// Credential files use OS temp dir (/tmp) because some filesystems
+	// (e.g. ZFS on TrueNAS) ignore chmod, causing "group or world access" errors.
+	tempDir, err := os.MkdirTemp(os.TempDir(), "pgpass_"+uuid.New().String())
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary directory: %w", err)
 	}
 
+	if err := os.Chmod(tempDir, 0o700); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return "", fmt.Errorf("failed to set temporary directory permissions: %w", err)
+	}
+
 	pgpassFile := filepath.Join(tempDir, ".pgpass")
-	err = os.WriteFile(pgpassFile, []byte(pgpassContent), 0600)
+	err = os.WriteFile(pgpassFile, []byte(pgpassContent), 0o600)
 	if err != nil {
+		_ = os.RemoveAll(tempDir)
 		return "", fmt.Errorf("failed to write temporary .pgpass file: %w", err)
 	}
 

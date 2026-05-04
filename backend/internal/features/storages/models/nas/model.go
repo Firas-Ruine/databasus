@@ -3,7 +3,6 @@ package nas_storage
 import (
 	"context"
 	"crypto/tls"
-	"databasus-backend/internal/util/encryption"
 	"errors"
 	"fmt"
 	"io"
@@ -15,9 +14,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hirochachacha/go-smb2"
+
+	"databasus-backend/internal/util/encryption"
 )
 
 const (
+	nasDeleteTimeout = 30 * time.Second
+
 	// Chunk size for NAS uploads - 16MB provides good balance between
 	// memory usage and upload efficiency. This creates backpressure to pg_dump
 	// by only reading one chunk at a time and waiting for NAS to confirm receipt.
@@ -44,7 +47,7 @@ func (n *NASStorage) SaveFile(
 	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
 	logger *slog.Logger,
-	fileID uuid.UUID,
+	fileName string,
 	file io.Reader,
 ) error {
 	select {
@@ -53,19 +56,19 @@ func (n *NASStorage) SaveFile(
 	default:
 	}
 
-	logger.Info("Starting to save file to NAS storage", "fileId", fileID.String(), "host", n.Host)
+	logger.Info("Starting to save file to NAS storage", "fileName", fileName, "host", n.Host)
 
 	session, err := n.createSessionWithContext(ctx, encryptor)
 	if err != nil {
-		logger.Error("Failed to create NAS session", "fileId", fileID.String(), "error", err)
+		logger.Error("Failed to create NAS session", "fileName", fileName, "error", err)
 		return fmt.Errorf("failed to create NAS session: %w", err)
 	}
 	defer func() {
 		if logoffErr := session.Logoff(); logoffErr != nil {
 			logger.Error(
 				"Failed to logoff NAS session",
-				"fileId",
-				fileID.String(),
+				"fileName",
+				fileName,
 				"error",
 				logoffErr,
 			)
@@ -76,8 +79,8 @@ func (n *NASStorage) SaveFile(
 	if err != nil {
 		logger.Error(
 			"Failed to mount NAS share",
-			"fileId",
-			fileID.String(),
+			"fileName",
+			fileName,
 			"share",
 			n.Share,
 			"error",
@@ -89,8 +92,8 @@ func (n *NASStorage) SaveFile(
 		if umountErr := fs.Umount(); umountErr != nil {
 			logger.Error(
 				"Failed to unmount NAS share",
-				"fileId",
-				fileID.String(),
+				"fileName",
+				fileName,
 				"error",
 				umountErr,
 			)
@@ -102,8 +105,8 @@ func (n *NASStorage) SaveFile(
 		if err := n.ensureDirectory(fs, n.Path); err != nil {
 			logger.Error(
 				"Failed to ensure directory",
-				"fileId",
-				fileID.String(),
+				"fileName",
+				fileName,
 				"path",
 				n.Path,
 				"error",
@@ -113,15 +116,15 @@ func (n *NASStorage) SaveFile(
 		}
 	}
 
-	filePath := n.getFilePath(fileID.String())
-	logger.Debug("Creating file on NAS", "fileId", fileID.String(), "filePath", filePath)
+	filePath := n.getFilePath(fileName)
+	logger.Debug("Creating file on NAS", "fileName", fileName, "filePath", filePath)
 
 	nasFile, err := fs.Create(filePath)
 	if err != nil {
 		logger.Error(
 			"Failed to create file on NAS",
-			"fileId",
-			fileID.String(),
+			"fileName",
+			fileName,
 			"filePath",
 			filePath,
 			"error",
@@ -131,21 +134,21 @@ func (n *NASStorage) SaveFile(
 	}
 	defer func() {
 		if closeErr := nasFile.Close(); closeErr != nil {
-			logger.Error("Failed to close NAS file", "fileId", fileID.String(), "error", closeErr)
+			logger.Error("Failed to close NAS file", "fileName", fileName, "error", closeErr)
 		}
 	}()
 
-	logger.Debug("Copying file data to NAS", "fileId", fileID.String())
+	logger.Debug("Copying file data to NAS", "fileName", fileName)
 	_, err = copyWithContext(ctx, nasFile, file)
 	if err != nil {
-		logger.Error("Failed to write file to NAS", "fileId", fileID.String(), "error", err)
+		logger.Error("Failed to write file to NAS", "fileName", fileName, "error", err)
 		return fmt.Errorf("failed to write file to NAS: %w", err)
 	}
 
 	logger.Info(
 		"Successfully saved file to NAS storage",
-		"fileId",
-		fileID.String(),
+		"fileName",
+		fileName,
 		"filePath",
 		filePath,
 	)
@@ -154,7 +157,7 @@ func (n *NASStorage) SaveFile(
 
 func (n *NASStorage) GetFile(
 	encryptor encryption.FieldEncryptor,
-	fileID uuid.UUID,
+	fileName string,
 ) (io.ReadCloser, error) {
 	session, err := n.createSession(encryptor)
 	if err != nil {
@@ -167,14 +170,14 @@ func (n *NASStorage) GetFile(
 		return nil, fmt.Errorf("failed to mount share '%s': %w", n.Share, err)
 	}
 
-	filePath := n.getFilePath(fileID.String())
+	filePath := n.getFilePath(fileName)
 
 	// Check if file exists
 	_, err = fs.Stat(filePath)
 	if err != nil {
 		_ = fs.Umount()
 		_ = session.Logoff()
-		return nil, fmt.Errorf("file not found: %s", fileID.String())
+		return nil, fmt.Errorf("file not found: %s", fileName)
 	}
 
 	nasFile, err := fs.Open(filePath)
@@ -192,8 +195,11 @@ func (n *NASStorage) GetFile(
 	}, nil
 }
 
-func (n *NASStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileID uuid.UUID) error {
-	session, err := n.createSession(encryptor)
+func (n *NASStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), nasDeleteTimeout)
+	defer cancel()
+
+	session, err := n.createSessionWithContext(ctx, encryptor)
 	if err != nil {
 		return fmt.Errorf("failed to create NAS session: %w", err)
 	}
@@ -209,12 +215,10 @@ func (n *NASStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileID uuid
 		_ = fs.Umount()
 	}()
 
-	filePath := n.getFilePath(fileID.String())
+	filePath := n.getFilePath(fileName)
 
-	// Check if file exists before trying to delete
 	_, err = fs.Stat(filePath)
 	if err != nil {
-		// File doesn't exist, consider it already deleted
 		return nil
 	}
 
@@ -352,7 +356,7 @@ func (n *NASStorage) createConnectionWithContext(ctx context.Context) (net.Conn,
 			ServerName:         n.Host,
 			InsecureSkipVerify: false,
 		}
-		conn, err := tls.DialWithDialer(dialer, "tcp", address, tlsConfig)
+		conn, err := (&tls.Dialer{NetDialer: dialer, Config: tlsConfig}).DialContext(ctx, "tcp", address)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create SSL connection to %s: %w", address, err)
 		}
@@ -396,7 +400,7 @@ func (n *NASStorage) ensureDirectory(fs *smb2.Share, path string) error {
 		_, err := fs.Stat(currentPath)
 		if err != nil {
 			// Directory doesn't exist, try to create it
-			err = fs.Mkdir(currentPath, 0755)
+			err = fs.Mkdir(currentPath, 0o755)
 			if err != nil {
 				return fmt.Errorf("failed to create directory '%s': %w", currentPath, err)
 			}

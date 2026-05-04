@@ -3,7 +3,6 @@ package azure_blob_storage
 import (
 	"bytes"
 	"context"
-	"databasus-backend/internal/util/encryption"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -19,6 +18,8 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/google/uuid"
+
+	"databasus-backend/internal/util/encryption"
 )
 
 const (
@@ -26,6 +27,7 @@ const (
 	azureResponseTimeout     = 30 * time.Second
 	azureIdleConnTimeout     = 90 * time.Second
 	azureTLSHandshakeTimeout = 30 * time.Second
+	azureDeleteTimeout       = 30 * time.Second
 
 	// Chunk size for block blob uploads - 16MB provides good balance between
 	// memory usage and upload efficiency. This creates backpressure to pg_dump
@@ -67,7 +69,7 @@ func (s *AzureBlobStorage) SaveFile(
 	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
 	logger *slog.Logger,
-	fileID uuid.UUID,
+	fileName string,
 	file io.Reader,
 ) error {
 	select {
@@ -81,7 +83,7 @@ func (s *AzureBlobStorage) SaveFile(
 		return err
 	}
 
-	blobName := s.buildBlobName(fileID.String())
+	blobName := s.buildBlobName(fileName)
 	blockBlobClient := client.ServiceClient().
 		NewContainerClient(s.ContainerName).
 		NewBlockBlobClient(blobName)
@@ -107,7 +109,7 @@ func (s *AzureBlobStorage) SaveFile(
 			return fmt.Errorf("read error: %w", readErr)
 		}
 
-		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%06d", blockNumber)))
+		blockID := base64.StdEncoding.EncodeToString(fmt.Appendf(nil, "%06d", blockNumber))
 
 		_, err := blockBlobClient.StageBlock(
 			ctx,
@@ -156,14 +158,14 @@ func (s *AzureBlobStorage) SaveFile(
 
 func (s *AzureBlobStorage) GetFile(
 	encryptor encryption.FieldEncryptor,
-	fileID uuid.UUID,
+	fileName string,
 ) (io.ReadCloser, error) {
 	client, err := s.getClient(encryptor)
 	if err != nil {
 		return nil, err
 	}
 
-	blobName := s.buildBlobName(fileID.String())
+	blobName := s.buildBlobName(fileName)
 
 	response, err := client.DownloadStream(
 		context.TODO(),
@@ -178,16 +180,19 @@ func (s *AzureBlobStorage) GetFile(
 	return response.Body, nil
 }
 
-func (s *AzureBlobStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileID uuid.UUID) error {
+func (s *AzureBlobStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error {
 	client, err := s.getClient(encryptor)
 	if err != nil {
 		return err
 	}
 
-	blobName := s.buildBlobName(fileID.String())
+	blobName := s.buildBlobName(fileName)
+
+	ctx, cancel := context.WithTimeout(context.Background(), azureDeleteTimeout)
+	defer cancel()
 
 	_, err = client.DeleteBlob(
-		context.TODO(),
+		ctx,
 		s.ContainerName,
 		blobName,
 		nil,
@@ -332,7 +337,7 @@ func (s *AzureBlobStorage) buildBlobName(fileName string) string {
 	prefix = strings.TrimPrefix(prefix, "/")
 
 	if !strings.HasSuffix(prefix, "/") {
-		prefix = prefix + "/"
+		prefix += "/"
 	}
 
 	return prefix + fileName

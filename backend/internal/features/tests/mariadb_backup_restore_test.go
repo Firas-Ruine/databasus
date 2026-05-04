@@ -17,13 +17,11 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"databasus-backend/internal/config"
-	"databasus-backend/internal/features/backups/backups"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	mariadbtypes "databasus-backend/internal/features/databases/databases/mariadb"
-	"databasus-backend/internal/features/restores"
-	restores_enums "databasus-backend/internal/features/restores/enums"
-	restores_models "databasus-backend/internal/features/restores/models"
+	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
@@ -149,6 +147,26 @@ func Test_BackupAndRestoreMariadb_WithReadOnlyUser_RestoreIsSuccessful(t *testin
 	}
 }
 
+func Test_BackupAndRestoreMariadb_WithExcludeEvents_EventsNotRestored(t *testing.T) {
+	env := config.GetEnv()
+	cases := []struct {
+		name    string
+		version tools.MariadbVersion
+		port    string
+	}{
+		{"MariaDB 10.5", tools.MariadbVersion105, env.TestMariadb105Port},
+		{"MariaDB 10.11", tools.MariadbVersion1011, env.TestMariadb1011Port},
+		{"MariaDB 11.4", tools.MariadbVersion114, env.TestMariadb114Port},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testMariadbBackupRestoreWithExcludeEventsForVersion(t, tc.version, tc.port)
+		})
+	}
+}
+
 func testMariadbBackupRestoreForVersion(
 	t *testing.T,
 	mariadbVersion tools.MariadbVersion,
@@ -189,7 +207,7 @@ func testMariadbBackupRestoreForVersion(
 	createBackupViaAPI(t, router, database.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 
 	newDBName := "restoreddb_mariadb"
 	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
@@ -213,7 +231,7 @@ func testMariadbBackupRestoreForVersion(
 	)
 
 	restore := waitForMariadbRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	var tableExists int
 	err = newDB.Get(
@@ -286,7 +304,7 @@ func testMariadbBackupRestoreWithEncryptionForVersion(
 	createBackupViaAPI(t, router, database.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 	assert.Equal(t, backups_config.BackupEncryptionEncrypted, backup.Encryption)
 
 	newDBName := "restoreddb_mariadb_encrypted"
@@ -311,7 +329,7 @@ func testMariadbBackupRestoreWithEncryptionForVersion(
 	)
 
 	restore := waitForMariadbRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	var tableExists int
 	err = newDB.Get(
@@ -394,7 +412,7 @@ func testMariadbBackupRestoreWithReadOnlyUserForVersion(
 	createBackupViaAPI(t, router, updatedDatabase.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, updatedDatabase.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 
 	newDBName := "restoreddb_mariadb_readonly"
 	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
@@ -418,7 +436,7 @@ func testMariadbBackupRestoreWithReadOnlyUserForVersion(
 	)
 
 	restore := waitForMariadbRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	var tableExists int
 	err = newDB.Get(
@@ -506,7 +524,7 @@ func createMariadbRestoreViaAPI(
 	version tools.MariadbVersion,
 	token string,
 ) {
-	request := restores.RestoreBackupRequest{
+	request := restores_core.RestoreBackupRequest{
 		MariadbDatabase: &mariadbtypes.MariadbDatabase{
 			Host:     host,
 			Port:     port,
@@ -533,7 +551,7 @@ func waitForMariadbRestoreCompletion(
 	backupID uuid.UUID,
 	token string,
 	timeout time.Duration,
-) *restores_models.Restore {
+) *restores_core.Restore {
 	startTime := time.Now()
 	pollInterval := 500 * time.Millisecond
 
@@ -542,7 +560,7 @@ func waitForMariadbRestoreCompletion(
 			t.Fatalf("Timeout waiting for MariaDB restore completion after %v", timeout)
 		}
 
-		var restoresList []*restores_models.Restore
+		var restoresList []*restores_core.Restore
 		test_utils.MakeGetRequestAndUnmarshal(
 			t,
 			router,
@@ -553,10 +571,10 @@ func waitForMariadbRestoreCompletion(
 		)
 
 		for _, restore := range restoresList {
-			if restore.Status == restores_enums.RestoreStatusCompleted {
+			if restore.Status == restores_core.RestoreStatusCompleted {
 				return restore
 			}
-			if restore.Status == restores_enums.RestoreStatusFailed {
+			if restore.Status == restores_core.RestoreStatusFailed {
 				failMsg := "unknown error"
 				if restore.FailMessage != nil {
 					failMsg = *restore.FailMessage
@@ -569,7 +587,7 @@ func waitForMariadbRestoreCompletion(
 	}
 }
 
-func verifyMariadbDataIntegrity(t *testing.T, originalDB *sqlx.DB, restoredDB *sqlx.DB) {
+func verifyMariadbDataIntegrity(t *testing.T, originalDB, restoredDB *sqlx.DB) {
 	var originalData []MariadbTestDataItem
 	var restoredData []MariadbTestDataItem
 
@@ -607,7 +625,7 @@ func connectToMariadbContainer(
 	dbName := "testdb"
 	password := "rootpassword"
 	username := "root"
-	host := "127.0.0.1"
+	host := config.GetEnv().TestLocalhost
 
 	portInt, err := strconv.Atoi(port)
 	if err != nil {
@@ -703,4 +721,146 @@ func updateMariadbDatabaseCredentialsViaAPI(
 	}
 
 	return &updatedDatabase
+}
+
+func testMariadbBackupRestoreWithExcludeEventsForVersion(
+	t *testing.T,
+	mariadbVersion tools.MariadbVersion,
+	port string,
+) {
+	container, err := connectToMariadbContainer(mariadbVersion, port)
+	if err != nil {
+		t.Skipf("Skipping MariaDB %s test: %v", mariadbVersion, err)
+		return
+	}
+	defer func() {
+		if container.DB != nil {
+			container.DB.Close()
+		}
+	}()
+
+	setupMariadbTestData(t, container.DB)
+
+	_, err = container.DB.Exec(`
+		CREATE EVENT IF NOT EXISTS test_event
+		ON SCHEDULE EVERY 1 DAY
+		DO BEGIN
+			INSERT INTO test_data (name, value) VALUES ('event_test', 999);
+		END
+	`)
+	if err != nil {
+		t.Skipf(
+			"Skipping test: MariaDB version doesn't support events or event scheduler disabled: %v",
+			err,
+		)
+		return
+	}
+
+	router := createTestRouter()
+	user := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace(
+		"MariaDB Exclude Events Test Workspace",
+		user,
+		router,
+	)
+
+	storage := storages.CreateTestStorage(workspace.ID)
+
+	database := createMariadbDatabaseViaAPI(
+		t, router, "MariaDB Exclude Events Test Database", workspace.ID,
+		container.Host, container.Port,
+		container.Username, container.Password, container.Database,
+		container.Version,
+		user.Token,
+	)
+
+	database.Mariadb.IsExcludeEvents = true
+	w := workspaces_testing.MakeAPIRequest(
+		router,
+		"POST",
+		"/api/v1/databases/update",
+		"Bearer "+user.Token,
+		database,
+	)
+	if w.Code != http.StatusOK {
+		t.Fatalf(
+			"Failed to update database with IsExcludeEvents. Status: %d, Body: %s",
+			w.Code,
+			w.Body.String(),
+		)
+	}
+
+	enableBackupsViaAPI(
+		t, router, database.ID, storage.ID,
+		backups_config.BackupEncryptionNone, user.Token,
+	)
+
+	createBackupViaAPI(t, router, database.ID, user.Token)
+
+	backup := waitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
+
+	newDBName := "restoreddb_mariadb_no_events"
+	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
+	assert.NoError(t, err)
+
+	_, err = container.DB.Exec(fmt.Sprintf("CREATE DATABASE %s;", newDBName))
+	assert.NoError(t, err)
+
+	newDSN := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+		container.Username, container.Password, container.Host, container.Port, newDBName)
+	newDB, err := sqlx.Connect("mysql", newDSN)
+	assert.NoError(t, err)
+	defer newDB.Close()
+
+	createMariadbRestoreViaAPI(
+		t, router, backup.ID,
+		container.Host, container.Port,
+		container.Username, container.Password, newDBName,
+		container.Version,
+		user.Token,
+	)
+
+	restore := waitForMariadbRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
+
+	var tableExists int
+	err = newDB.Get(
+		&tableExists,
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = 'test_data'",
+		newDBName,
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, tableExists, "Table 'test_data' should exist in restored database")
+
+	verifyMariadbDataIntegrity(t, container.DB, newDB)
+
+	var eventCount int
+	err = newDB.Get(
+		&eventCount,
+		"SELECT COUNT(*) FROM information_schema.events WHERE event_schema = ? AND event_name = 'test_event'",
+		newDBName,
+	)
+	assert.NoError(t, err)
+	assert.Equal(
+		t,
+		0,
+		eventCount,
+		"Event 'test_event' should NOT exist in restored database when IsExcludeEvents is true",
+	)
+
+	err = os.Remove(filepath.Join(config.GetEnv().DataFolder, backup.ID.String()))
+	if err != nil {
+		t.Logf("Warning: Failed to delete backup file: %v", err)
+	}
+
+	test_utils.MakeDeleteRequest(
+		t,
+		router,
+		"/api/v1/databases/"+database.ID.String(),
+		"Bearer "+user.Token,
+		http.StatusNoContent,
+	)
+	storages.RemoveTestStorage(storage.ID)
+	workspaces_testing.RemoveTestWorkspace(workspace, router)
 }

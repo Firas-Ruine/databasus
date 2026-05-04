@@ -1,29 +1,34 @@
 package restores
 
 import (
-	audit_logs "databasus-backend/internal/features/audit_logs"
-	"databasus-backend/internal/features/backups/backups"
-	backups_config "databasus-backend/internal/features/backups/config"
-	"databasus-backend/internal/features/databases"
-	"databasus-backend/internal/features/restores/enums"
-	"databasus-backend/internal/features/restores/models"
-	"databasus-backend/internal/features/restores/usecases"
-	"databasus-backend/internal/features/storages"
-	users_models "databasus-backend/internal/features/users/models"
-	workspaces_services "databasus-backend/internal/features/workspaces/services"
-	"databasus-backend/internal/util/encryption"
-	"databasus-backend/internal/util/tools"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
+
+	"databasus-backend/internal/config"
+	audit_logs "databasus-backend/internal/features/audit_logs"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
+	backups_services "databasus-backend/internal/features/backups/backups/services"
+	backups_config "databasus-backend/internal/features/backups/config"
+	"databasus-backend/internal/features/databases"
+	"databasus-backend/internal/features/disk"
+	restores_core "databasus-backend/internal/features/restores/core"
+	"databasus-backend/internal/features/restores/restoring"
+	"databasus-backend/internal/features/restores/usecases"
+	"databasus-backend/internal/features/storages"
+	tasks_cancellation "databasus-backend/internal/features/tasks/cancellation"
+	users_models "databasus-backend/internal/features/users/models"
+	workspaces_services "databasus-backend/internal/features/workspaces/services"
+	"databasus-backend/internal/util/encryption"
+	"databasus-backend/internal/util/tools"
 )
 
 type RestoreService struct {
-	backupService        *backups.BackupService
-	restoreRepository    *RestoreRepository
+	backupService        *backups_services.BackupService
+	restoreRepository    *restores_core.RestoreRepository
 	storageService       *storages.StorageService
 	backupConfigService  *backups_config.BackupConfigService
 	restoreBackupUsecase *usecases.RestoreBackupUsecase
@@ -32,16 +37,18 @@ type RestoreService struct {
 	workspaceService     *workspaces_services.WorkspaceService
 	auditLogService      *audit_logs.AuditLogService
 	fieldEncryptor       encryption.FieldEncryptor
+	diskService          *disk.DiskService
+	taskCancelManager    *tasks_cancellation.TaskCancelManager
 }
 
-func (s *RestoreService) OnBeforeBackupRemove(backup *backups.Backup) error {
+func (s *RestoreService) OnBeforeBackupRemove(backup *backups_core.Backup) error {
 	restores, err := s.restoreRepository.FindByBackupID(backup.ID)
 	if err != nil {
 		return err
 	}
 
 	for _, restore := range restores {
-		if restore.Status == enums.RestoreStatusInProgress {
+		if restore.Status == restores_core.RestoreStatusInProgress {
 			return errors.New("restore is in progress, backup cannot be removed")
 		}
 	}
@@ -58,7 +65,7 @@ func (s *RestoreService) OnBeforeBackupRemove(backup *backups.Backup) error {
 func (s *RestoreService) GetRestores(
 	user *users_models.User,
 	backupID uuid.UUID,
-) ([]*models.Restore, error) {
+) ([]*restores_core.Restore, error) {
 	backup, err := s.backupService.GetBackup(backupID)
 	if err != nil {
 		return nil, err
@@ -90,7 +97,7 @@ func (s *RestoreService) GetRestores(
 func (s *RestoreService) RestoreBackupWithAuth(
 	user *users_models.User,
 	backupID uuid.UUID,
-	requestDTO RestoreBackupRequest,
+	requestDTO restores_core.RestoreBackupRequest,
 ) error {
 	backup, err := s.backupService.GetBackup(backupID)
 	if err != nil {
@@ -122,22 +129,72 @@ func (s *RestoreService) RestoreBackupWithAuth(
 		return err
 	}
 
+	if config.GetEnv().IsCloud && requestDTO.PostgresqlDatabase != nil &&
+		requestDTO.PostgresqlDatabase.CpuCount > 1 {
+		s.logger.Warn("restore rejected: multi-thread mode not supported in cloud",
+			"requested_cpu_count", requestDTO.PostgresqlDatabase.CpuCount)
+
+		return errors.New(
+			"multi-thread restore is not supported in cloud mode, only single thread (CPU=1) is allowed",
+		)
+	}
+
 	if err := s.validateVersionCompatibility(backupDatabase, requestDTO); err != nil {
 		return err
 	}
 
-	go func() {
-		if err := s.RestoreBackup(backup, requestDTO); err != nil {
-			s.logger.Error("Failed to restore backup", "error", err)
+	// Validate disk space before starting restore
+	if err := s.validateDiskSpace(backup, requestDTO); err != nil {
+		return err
+	}
+
+	// Validate no parallel restores for the same database
+	if err := s.validateNoParallelRestores(backup.DatabaseID); err != nil {
+		return err
+	}
+
+	// Create restore record with the request configuration
+	restore := restores_core.Restore{
+		ID:                 uuid.New(),
+		Status:             restores_core.RestoreStatusInProgress,
+		BackupID:           backup.ID,
+		Backup:             backup,
+		CreatedAt:          time.Now().UTC(),
+		RestoreDurationMs:  0,
+		FailMessage:        nil,
+		PostgresqlDatabase: requestDTO.PostgresqlDatabase,
+		MysqlDatabase:      requestDTO.MysqlDatabase,
+		MariadbDatabase:    requestDTO.MariadbDatabase,
+		MongodbDatabase:    requestDTO.MongodbDatabase,
+	}
+
+	if err := s.restoreRepository.Save(&restore); err != nil {
+		return err
+	}
+
+	// Prepare database cache with credentials from the request
+	dbCache := &restoring.RestoreDatabaseCache{
+		PostgresqlDatabase: requestDTO.PostgresqlDatabase,
+		MysqlDatabase:      requestDTO.MysqlDatabase,
+		MariadbDatabase:    requestDTO.MariadbDatabase,
+		MongodbDatabase:    requestDTO.MongodbDatabase,
+	}
+
+	// Trigger restore via scheduler
+	scheduler := restoring.GetRestoresScheduler()
+	if err := scheduler.StartRestore(restore.ID, dbCache); err != nil {
+		// Mark restore as failed if we can't schedule it
+		failMsg := fmt.Sprintf("Failed to schedule restore: %v", err)
+		restore.FailMessage = &failMsg
+		restore.Status = restores_core.RestoreStatusFailed
+		if saveErr := s.restoreRepository.Save(&restore); saveErr != nil {
+			s.logger.Error("Failed to save restore after scheduling error", "error", saveErr)
 		}
-	}()
+		return err
+	}
 
 	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf(
-			"Database restored from backup %s for database: %s",
-			backupID.String(),
-			database.Name,
-		),
+		fmt.Sprintf("Database restored for database: %s", database.Name),
 		&user.ID,
 		database.WorkspaceID,
 	)
@@ -145,12 +202,18 @@ func (s *RestoreService) RestoreBackupWithAuth(
 	return nil
 }
 
-func (s *RestoreService) RestoreBackup(
-	backup *backups.Backup,
-	requestDTO RestoreBackupRequest,
+func (s *RestoreService) CancelRestore(
+	user *users_models.User,
+	restoreID uuid.UUID,
 ) error {
-	if backup.Status != backups.BackupStatusCompleted {
-		return errors.New("backup is not completed")
+	restore, err := s.restoreRepository.FindByID(restoreID)
+	if err != nil {
+		return err
+	}
+
+	backup, err := s.backupService.GetBackup(restore.BackupID)
+	if err != nil {
+		return err
 	}
 
 	database, err := s.databaseService.GetDatabaseByID(backup.DatabaseID)
@@ -158,114 +221,38 @@ func (s *RestoreService) RestoreBackup(
 		return err
 	}
 
-	switch database.Type {
-	case databases.DatabaseTypePostgres:
-		if requestDTO.PostgresqlDatabase == nil {
-			return errors.New("postgresql database is required")
-		}
-	case databases.DatabaseTypeMysql:
-		if requestDTO.MysqlDatabase == nil {
-			return errors.New("mysql database is required")
-		}
-	case databases.DatabaseTypeMariadb:
-		if requestDTO.MariadbDatabase == nil {
-			return errors.New("mariadb database is required")
-		}
-	case databases.DatabaseTypeMongodb:
-		if requestDTO.MongodbDatabase == nil {
-			return errors.New("mongodb database is required")
-		}
+	if database.WorkspaceID == nil {
+		return errors.New("cannot cancel restore for database without workspace")
 	}
 
-	restore := models.Restore{
-		ID:     uuid.New(),
-		Status: enums.RestoreStatusInProgress,
-
-		BackupID: backup.ID,
-		Backup:   backup,
-
-		CreatedAt:         time.Now().UTC(),
-		RestoreDurationMs: 0,
-
-		FailMessage: nil,
-	}
-
-	// Save the restore first
-	if err := s.restoreRepository.Save(&restore); err != nil {
-		return err
-	}
-
-	// Save the restore again to include the postgresql database
-	if err := s.restoreRepository.Save(&restore); err != nil {
-		return err
-	}
-
-	storage, err := s.storageService.GetStorageByID(backup.StorageID)
+	canManage, err := s.workspaceService.CanUserManageDBs(*database.WorkspaceID, user)
 	if err != nil {
 		return err
 	}
+	if !canManage {
+		return errors.New("insufficient permissions to cancel restore for this database")
+	}
 
-	backupConfig, err := s.backupConfigService.GetBackupConfigByDbId(
-		database.ID,
+	if restore.Status != restores_core.RestoreStatusInProgress {
+		return errors.New("restore is not in progress")
+	}
+
+	if err := s.taskCancelManager.CancelTask(restoreID); err != nil {
+		return err
+	}
+
+	s.auditLogService.WriteAuditLog(
+		fmt.Sprintf("Restore cancelled for database: %s", database.Name),
+		&user.ID,
+		database.WorkspaceID,
 	)
-	if err != nil {
-		return err
-	}
-
-	start := time.Now().UTC()
-
-	restoringToDB := &databases.Database{
-		Type:       database.Type,
-		Postgresql: requestDTO.PostgresqlDatabase,
-		Mysql:      requestDTO.MysqlDatabase,
-		Mariadb:    requestDTO.MariadbDatabase,
-		Mongodb:    requestDTO.MongodbDatabase,
-	}
-
-	if err := restoringToDB.PopulateVersionIfEmpty(s.logger, s.fieldEncryptor); err != nil {
-		return fmt.Errorf("failed to auto-detect database version: %w", err)
-	}
-
-	isExcludeExtensions := false
-	if requestDTO.PostgresqlDatabase != nil {
-		isExcludeExtensions = requestDTO.PostgresqlDatabase.IsExcludeExtensions
-	}
-
-	err = s.restoreBackupUsecase.Execute(
-		backupConfig,
-		restore,
-		database,
-		restoringToDB,
-		backup,
-		storage,
-		isExcludeExtensions,
-	)
-	if err != nil {
-		errMsg := err.Error()
-		restore.FailMessage = &errMsg
-		restore.Status = enums.RestoreStatusFailed
-		restore.RestoreDurationMs = time.Since(start).Milliseconds()
-
-		if err := s.restoreRepository.Save(&restore); err != nil {
-			return err
-		}
-
-		return err
-	}
-
-	restore.Status = enums.RestoreStatusCompleted
-	restore.RestoreDurationMs = time.Since(start).Milliseconds()
-
-	if err := s.restoreRepository.Save(&restore); err != nil {
-		return err
-	}
 
 	return nil
 }
 
 func (s *RestoreService) validateVersionCompatibility(
 	backupDatabase *databases.Database,
-	requestDTO RestoreBackupRequest,
+	requestDTO restores_core.RestoreBackupRequest,
 ) error {
 	// populate version
 	if requestDTO.MariadbDatabase != nil {
@@ -359,5 +346,77 @@ func (s *RestoreService) validateVersionCompatibility(
 				`For example, you can restore MongoDB 6.0 backup to MongoDB 6.0, 7.0 or higher. But cannot restore to 5.0`)
 		}
 	}
+
+	return nil
+}
+
+func (s *RestoreService) validateDiskSpace(
+	backup *backups_core.Backup,
+	requestDTO restores_core.RestoreBackupRequest,
+) error {
+	// Only validate disk space for PostgreSQL when file-based restore is needed:
+	// - CPU > 1 (parallel jobs require file)
+	// - IsExcludeExtensions (TOC filtering requires file)
+	// Other databases and PostgreSQL with CPU=1 without extension exclusion stream directly
+	if requestDTO.PostgresqlDatabase == nil {
+		return nil
+	}
+
+	needsFileBased := requestDTO.PostgresqlDatabase.CpuCount > 1 ||
+		requestDTO.PostgresqlDatabase.IsExcludeExtensions
+	if !needsFileBased {
+		return nil
+	}
+
+	diskUsage, err := s.diskService.GetDiskUsage()
+	if err != nil {
+		return fmt.Errorf("failed to check disk space: %w", err)
+	}
+
+	// Convert backup size from MB to bytes
+	backupSizeBytes := int64(backup.BackupSizeMb * 1024 * 1024)
+
+	// Calculate required space: backup size + 10% buffer
+	bufferBytes := int64(float64(backupSizeBytes) * 0.1)
+	requiredBytes := backupSizeBytes + bufferBytes
+
+	// Ensure minimum of 1 GB total (even if backup is small)
+	minRequiredBytes := int64(1024 * 1024 * 1024) // 1 GB
+	if requiredBytes < minRequiredBytes {
+		requiredBytes = minRequiredBytes
+	}
+
+	// Check if there's enough free space
+	if diskUsage.FreeSpaceBytes < requiredBytes {
+		backupSizeGB := float64(backupSizeBytes) / (1024 * 1024 * 1024)
+		bufferSizeGB := float64(bufferBytes) / (1024 * 1024 * 1024)
+		requiredGB := float64(requiredBytes) / (1024 * 1024 * 1024)
+		availableGB := float64(diskUsage.FreeSpaceBytes) / (1024 * 1024 * 1024)
+
+		return fmt.Errorf(
+			"to restore this backup, %.1f GB (%.1f GB backup + %.1f GB buffer) is required, but only %.1f GB is available. Please free up disk space before restoring",
+			requiredGB,
+			backupSizeGB,
+			bufferSizeGB,
+			availableGB,
+		)
+	}
+
+	return nil
+}
+
+func (s *RestoreService) validateNoParallelRestores(databaseID uuid.UUID) error {
+	inProgressRestores, err := s.restoreRepository.FindInProgressRestoresByDatabaseID(databaseID)
+	if err != nil {
+		return fmt.Errorf("failed to check for in-progress restores: %w", err)
+	}
+
+	isInProgress := len(inProgressRestores) > 0
+	if isInProgress {
+		return errors.New(
+			"another restore is already in progress for this database. Please wait for it to complete or cancel it before starting a new restore",
+		)
+	}
+
 	return nil
 }

@@ -1,15 +1,16 @@
 package databases
 
 import (
+	"errors"
+
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+
 	"databasus-backend/internal/features/databases/databases/mariadb"
 	"databasus-backend/internal/features/databases/databases/mongodb"
 	"databasus-backend/internal/features/databases/databases/mysql"
 	"databasus-backend/internal/features/databases/databases/postgresql"
 	"databasus-backend/internal/storage"
-	"errors"
-
-	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 type DatabaseRepository struct{}
@@ -120,7 +121,6 @@ func (r *DatabaseRepository) Save(database *Database) (*Database, error) {
 
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -242,4 +242,32 @@ func (r *DatabaseRepository) GetAllDatabases() ([]*Database, error) {
 	}
 
 	return databases, nil
+}
+
+func (r *DatabaseRepository) FindByAgentTokenHash(hash string) (*Database, error) {
+	var database Database
+
+	if err := storage.GetDb().
+		Where("agent_token = ?", hash).
+		First(&database).Error; err != nil {
+		return nil, err
+	}
+
+	return &database, nil
+}
+
+func (r *DatabaseRepository) GetDatabasesIDsByNotifierID(
+	notifierID uuid.UUID,
+) ([]uuid.UUID, error) {
+	var databasesIDs []uuid.UUID
+
+	if err := storage.
+		GetDb().
+		Table("database_notifiers").
+		Where("notifier_id = ?", notifierID).
+		Pluck("database_id", &databasesIDs).Error; err != nil {
+		return nil, err
+	}
+
+	return databasesIDs, nil
 }

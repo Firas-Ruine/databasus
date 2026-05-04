@@ -33,9 +33,21 @@ export const ShowMongoDbSpecificDataComponent = ({ database }: Props) => {
       </div>
 
       <div className="mb-1 flex w-full items-center">
-        <div className="min-w-[150px]">Use TLS</div>
-        <div>{database.mongodb?.useTls ? 'Yes' : 'No'}</div>
+        <div className="min-w-[150px]">Use HTTPS</div>
+        <div>{database.mongodb?.isHttps ? 'Yes' : 'No'}</div>
       </div>
+
+      <div className="mb-1 flex w-full items-center">
+        <div className="min-w-[150px]">CPU count</div>
+        <div>{database.mongodb?.cpuCount}</div>
+      </div>
+
+      {database.mongodb?.isDirectConnection && (
+        <div className="mb-1 flex w-full items-center">
+          <div className="min-w-[150px]">Direct connection</div>
+          <div>Yes</div>
+        </div>
+      )}
 
       {database.mongodb?.authDatabase && (
         <div className="mb-1 flex w-full items-center">
@@ -43,11 +55,6 @@ export const ShowMongoDbSpecificDataComponent = ({ database }: Props) => {
           <div>{database.mongodb.authDatabase}</div>
         </div>
       )}
-
-      <div className="mb-1 flex w-full items-center">
-        <div className="min-w-[150px]">CPU count</div>
-        <div>{database.mongodb?.cpuCount || 1}</div>
-      </div>
     </div>
   );
 };

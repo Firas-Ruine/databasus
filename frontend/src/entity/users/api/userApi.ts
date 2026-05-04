@@ -8,6 +8,8 @@ import type { InviteUserResponse } from '../model/InviteUserResponse';
 import type { IsAdminHasPasswordResponse } from '../model/IsAdminHasPasswordResponse';
 import type { OAuthCallbackRequest } from '../model/OAuthCallbackRequest';
 import type { OAuthCallbackResponse } from '../model/OAuthCallbackResponse';
+import type { ResetPasswordRequest } from '../model/ResetPasswordRequest';
+import type { SendResetPasswordCodeRequest } from '../model/SendResetPasswordCodeRequest';
 import type { SetAdminPasswordRequest } from '../model/SetAdminPasswordRequest';
 import type { SignInRequest } from '../model/SignInRequest';
 import type { SignInResponse } from '../model/SignInResponse';
@@ -29,10 +31,18 @@ const notifyAuthListeners = () => {
 };
 
 export const userApi = {
-  async signUp(signUpRequest: SignUpRequest) {
+  async signUp(signUpRequest: SignUpRequest): Promise<SignInResponse> {
     const requestOptions: RequestOptions = new RequestOptions();
     requestOptions.setBody(JSON.stringify(signUpRequest));
-    return apiHelper.fetchPostRaw(`${getApplicationServer()}/api/v1/users/signup`, requestOptions);
+
+    return apiHelper
+      .fetchPostJson(`${getApplicationServer()}/api/v1/users/signup`, requestOptions)
+      .then((response: unknown): SignInResponse => {
+        const typedResponse = response as SignInResponse;
+        saveAuthorizedData(typedResponse.token, typedResponse.userId);
+        notifyAuthListeners();
+        return typedResponse;
+      });
   },
 
   async signIn(signInRequest: SignInRequest): Promise<SignInResponse> {
@@ -132,6 +142,24 @@ export const userApi = {
         notifyAuthListeners();
         return typedResponse;
       });
+  },
+
+  async sendResetPasswordCode(request: SendResetPasswordCodeRequest): Promise<{ message: string }> {
+    const requestOptions: RequestOptions = new RequestOptions();
+    requestOptions.setBody(JSON.stringify(request));
+    return apiHelper.fetchPostJson(
+      `${getApplicationServer()}/api/v1/users/send-reset-password-code`,
+      requestOptions,
+    );
+  },
+
+  async resetPassword(request: ResetPasswordRequest): Promise<{ message: string }> {
+    const requestOptions: RequestOptions = new RequestOptions();
+    requestOptions.setBody(JSON.stringify(request));
+    return apiHelper.fetchPostJson(
+      `${getApplicationServer()}/api/v1/users/reset-password`,
+      requestOptions,
+    );
   },
 
   isAuthorized: (): boolean => !!accessTokenHelper.getAccessToken(),

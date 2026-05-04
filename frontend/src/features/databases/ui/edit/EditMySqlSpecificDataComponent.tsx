@@ -2,9 +2,12 @@ import { CopyOutlined } from '@ant-design/icons';
 import { App, Button, Input, InputNumber, Switch } from 'antd';
 import { useEffect, useState } from 'react';
 
+import { IS_CLOUD } from '../../../../constants';
 import { type Database, databaseApi } from '../../../../entity/databases';
 import { MySqlConnectionStringParser } from '../../../../entity/databases/model/mysql/MySqlConnectionStringParser';
+import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
+import { ClipboardPasteModalComponent } from '../../../../shared/ui';
 
 interface Props {
   database: Database;
@@ -45,53 +48,72 @@ export const EditMySqlSpecificDataComponent = ({
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
 
+  const [isShowPasteModal, setIsShowPasteModal] = useState(false);
+
+  const applyConnectionString = (text: string) => {
+    const trimmedText = text.trim();
+
+    if (!trimmedText) {
+      message.error('Clipboard is empty');
+      return;
+    }
+
+    const result = MySqlConnectionStringParser.parse(trimmedText);
+
+    if ('error' in result) {
+      message.error(result.error);
+      return;
+    }
+
+    if (!editingDatabase?.mysql) return;
+
+    const updatedDatabase: Database = {
+      ...editingDatabase,
+      mysql: {
+        ...editingDatabase.mysql,
+        host: result.host,
+        port: result.port,
+        username: result.username,
+        password: result.password,
+        database: result.database,
+        isHttps: result.isHttps,
+      },
+    };
+
+    setEditingDatabase(updatedDatabase);
+    setIsConnectionTested(false);
+    message.success('Connection string parsed successfully');
+  };
+
   const parseFromClipboard = async () => {
+    if (!ClipboardHelper.isClipboardApiAvailable()) {
+      setIsShowPasteModal(true);
+      return;
+    }
+
     try {
-      const text = await navigator.clipboard.readText();
-      const trimmedText = text.trim();
-
-      if (!trimmedText) {
-        message.error('Clipboard is empty');
-        return;
-      }
-
-      const result = MySqlConnectionStringParser.parse(trimmedText);
-
-      if ('error' in result) {
-        message.error(result.error);
-        return;
-      }
-
-      if (!editingDatabase?.mysql) return;
-
-      const updatedDatabase: Database = {
-        ...editingDatabase,
-        mysql: {
-          ...editingDatabase.mysql,
-          host: result.host,
-          port: result.port,
-          username: result.username,
-          password: result.password,
-          database: result.database,
-          isHttps: result.isHttps,
-        },
-      };
-
-      setEditingDatabase(updatedDatabase);
-      setIsConnectionTested(false);
-      message.success('Connection string parsed successfully');
+      const text = await ClipboardHelper.readFromClipboard();
+      applyConnectionString(text);
     } catch {
       message.error('Failed to read clipboard. Please check browser permissions.');
     }
   };
 
   const testConnection = async () => {
-    if (!editingDatabase) return;
+    if (!editingDatabase?.mysql) return;
     setIsTestingConnection(true);
     setIsConnectionFailed(false);
 
+    const trimmedDatabase = {
+      ...editingDatabase,
+      mysql: {
+        ...editingDatabase.mysql,
+        password: editingDatabase.mysql.password?.trim(),
+      },
+    };
+
     try {
-      await databaseApi.testDatabaseConnectionDirect(editingDatabase);
+      await databaseApi.testDatabaseConnectionDirect(trimmedDatabase);
       setIsConnectionTested(true);
       ToastHelper.showToast({
         title: 'Connection test passed',
@@ -106,13 +128,21 @@ export const EditMySqlSpecificDataComponent = ({
   };
 
   const saveDatabase = async () => {
-    if (!editingDatabase) return;
+    if (!editingDatabase?.mysql) return;
+
+    const trimmedDatabase = {
+      ...editingDatabase,
+      mysql: {
+        ...editingDatabase.mysql,
+        password: editingDatabase.mysql.password?.trim(),
+      },
+    };
 
     if (isSaveToApi) {
       setIsSaving(true);
 
       try {
-        await databaseApi.updateDatabase(editingDatabase);
+        await databaseApi.updateDatabase(trimmedDatabase);
       } catch (e) {
         alert((e as Error).message);
       }
@@ -120,7 +150,7 @@ export const EditMySqlSpecificDataComponent = ({
       setIsSaving(false);
     }
 
-    onSaved(editingDatabase);
+    onSaved(trimmedDatabase);
   };
 
   useEffect(() => {
@@ -180,7 +210,7 @@ export const EditMySqlSpecificDataComponent = ({
         />
       </div>
 
-      {isLocalhostDb && (
+      {isLocalhostDb && !IS_CLOUD && (
         <div className="mb-1 flex">
           <div className="min-w-[150px]" />
           <div className="max-w-[200px] text-xs text-gray-500 dark:text-gray-400">
@@ -246,7 +276,7 @@ export const EditMySqlSpecificDataComponent = ({
 
             setEditingDatabase({
               ...editingDatabase,
-              mysql: { ...editingDatabase.mysql, password: e.target.value.trim() },
+              mysql: { ...editingDatabase.mysql, password: e.target.value },
             });
             setIsConnectionTested(false);
           }}
@@ -336,12 +366,21 @@ export const EditMySqlSpecificDataComponent = ({
         )}
       </div>
 
-      {isConnectionFailed && (
+      {isConnectionFailed && !IS_CLOUD && (
         <div className="mt-3 text-sm text-gray-500 dark:text-gray-400">
           If your database uses IP whitelist, make sure Databasus server IP is added to the allowed
           list.
         </div>
       )}
+
+      <ClipboardPasteModalComponent
+        open={isShowPasteModal}
+        onSubmit={(text) => {
+          setIsShowPasteModal(false);
+          applyConnectionString(text);
+        }}
+        onCancel={() => setIsShowPasteModal(false)}
+      />
     </div>
   );
 };

@@ -3,20 +3,22 @@ package users_dto
 import (
 	"time"
 
-	users_enums "databasus-backend/internal/features/users/enums"
-
 	"github.com/google/uuid"
+
+	users_enums "databasus-backend/internal/features/users/enums"
 )
 
 type SignUpRequestDTO struct {
-	Email    string `json:"email"    binding:"required"`
-	Password string `json:"password" binding:"required,min=8"`
-	Name     string `json:"name"     binding:"required"`
+	Email                    string  `json:"email"                    binding:"required"`
+	Password                 string  `json:"password"                 binding:"required,min=8"`
+	Name                     string  `json:"name"                     binding:"required"`
+	CloudflareTurnstileToken *string `json:"cloudflareTurnstileToken"`
 }
 
 type SignInRequestDTO struct {
-	Email    string `json:"email"    binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Email                    string  `json:"email"                    binding:"required"`
+	Password                 string  `json:"password"                 binding:"required"`
+	CloudflareTurnstileToken *string `json:"cloudflareTurnstileToken"`
 }
 
 type SignInResponseDTO struct {
@@ -91,4 +93,15 @@ type OAuthCallbackResponseDTO struct {
 	Email     string    `json:"email"`
 	Token     string    `json:"token"`
 	IsNewUser bool      `json:"isNewUser"`
+}
+
+type SendResetPasswordCodeRequestDTO struct {
+	Email                    string  `json:"email"                    binding:"required,email"`
+	CloudflareTurnstileToken *string `json:"cloudflareTurnstileToken"`
+}
+
+type ResetPasswordRequestDTO struct {
+	Email       string `json:"email"       binding:"required,email"`
+	Code        string `json:"code"        binding:"required"`
+	NewPassword string `json:"newPassword" binding:"required,min=8"`
 }

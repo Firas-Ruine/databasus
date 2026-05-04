@@ -1,18 +1,24 @@
 package storages
 
 import (
+	"sync"
+
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	"databasus-backend/internal/util/encryption"
 )
 
-var storageRepository = &StorageRepository{}
-var storageService = &StorageService{
-	storageRepository,
-	workspaces_services.GetWorkspaceService(),
-	audit_logs.GetAuditLogService(),
-	encryption.GetFieldEncryptor(),
-}
+var (
+	storageRepository = &StorageRepository{}
+	storageService    = &StorageService{
+		storageRepository,
+		workspaces_services.GetWorkspaceService(),
+		audit_logs.GetAuditLogService(),
+		encryption.GetFieldEncryptor(),
+		nil,
+	}
+)
+
 var storageController = &StorageController{
 	storageService,
 	workspaces_services.GetWorkspaceService(),
@@ -26,6 +32,6 @@ func GetStorageController() *StorageController {
 	return storageController
 }
 
-func SetupDependencies() {
+var SetupDependencies = sync.OnceFunc(func() {
 	workspaces_services.GetWorkspaceService().AddWorkspaceDeletionListener(storageService)
-}
+})

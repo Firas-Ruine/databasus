@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,10 +12,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 
+	"databasus-backend/internal/config"
+	"databasus-backend/internal/features/audit_logs"
 	"databasus-backend/internal/features/databases/databases/mariadb"
 	"databasus-backend/internal/features/databases/databases/mongodb"
 	"databasus-backend/internal/features/databases/databases/postgresql"
 	users_enums "databasus-backend/internal/features/users/enums"
+	users_middleware "databasus-backend/internal/features/users/middleware"
+	users_services "databasus-backend/internal/features/users/services"
 	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_controllers "databasus-backend/internal/features/workspaces/controllers"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
@@ -22,15 +27,6 @@ import (
 	test_utils "databasus-backend/internal/util/testing"
 	"databasus-backend/internal/util/tools"
 )
-
-func createTestRouter() *gin.Engine {
-	router := workspaces_testing.CreateTestRouter(
-		workspaces_controllers.GetWorkspaceController(),
-		workspaces_controllers.GetMembershipController(),
-		GetDatabaseController(),
-	)
-	return router
-}
 
 func Test_CreateDatabase_PermissionsEnforced(t *testing.T) {
 	tests := []struct {
@@ -75,6 +71,7 @@ func Test_CreateDatabase_PermissionsEnforced(t *testing.T) {
 			router := createTestRouter()
 			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -84,24 +81,21 @@ func Test_CreateDatabase_PermissionsEnforced(t *testing.T) {
 				testUserToken = owner.Token
 			} else if tt.workspaceRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			}
 
-			testDbName := "test_db"
 			request := Database{
 				Name:        "Test Database",
 				WorkspaceID: &workspace.ID,
 				Type:        DatabaseTypePostgres,
-				Postgresql: &postgresql.PostgresqlDatabase{
-					Version:  tools.PostgresqlVersion16,
-					Host:     "localhost",
-					Port:     5432,
-					Username: "postgres",
-					Password: "postgres",
-					Database: &testDbName,
-					CpuCount: 1,
-				},
+				Postgresql:  getTestPostgresConfig(),
 			}
 
 			var response Database
@@ -116,6 +110,7 @@ func Test_CreateDatabase_PermissionsEnforced(t *testing.T) {
 			)
 
 			if tt.expectSuccess {
+				defer RemoveTestDatabase(&response)
 				assert.Equal(t, "Test Database", response.Name)
 				assert.NotEqual(t, uuid.Nil, response.ID)
 			} else {
@@ -129,23 +124,15 @@ func Test_CreateDatabase_WhenUserIsNotWorkspaceMember_ReturnsForbidden(t *testin
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
-	testDbName := "test_db"
 	request := Database{
 		Name:        "Test Database",
 		WorkspaceID: &workspace.ID,
 		Type:        DatabaseTypePostgres,
-		Postgresql: &postgresql.PostgresqlDatabase{
-			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
-			Port:     5432,
-			Username: "postgres",
-			Password: "postgres",
-			Database: &testDbName,
-			CpuCount: 1,
-		},
+		Postgresql:  getTestPostgresConfig(),
 	}
 
 	testResp := test_utils.MakePostRequest(
@@ -158,6 +145,66 @@ func Test_CreateDatabase_WhenUserIsNotWorkspaceMember_ReturnsForbidden(t *testin
 	)
 
 	assert.Contains(t, string(testResp.Body), "insufficient permissions")
+}
+
+func Test_CreateDatabase_WalV1Type_NoConnectionFieldsRequired(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	request := Database{
+		Name:        "Test WAL Database",
+		WorkspaceID: &workspace.ID,
+		Type:        DatabaseTypePostgres,
+		Postgresql: &postgresql.PostgresqlDatabase{
+			BackupType: postgresql.PostgresBackupTypeWalV1,
+			CpuCount:   1,
+		},
+	}
+
+	var response Database
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/databases/create",
+		"Bearer "+owner.Token,
+		request,
+		http.StatusCreated,
+		&response,
+	)
+	defer RemoveTestDatabase(&response)
+
+	assert.Equal(t, "Test WAL Database", response.Name)
+	assert.NotEqual(t, uuid.Nil, response.ID)
+}
+
+func Test_CreateDatabase_PgDumpType_ConnectionFieldsRequired(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	request := Database{
+		Name:        "Test PG_DUMP Database",
+		WorkspaceID: &workspace.ID,
+		Type:        DatabaseTypePostgres,
+		Postgresql: &postgresql.PostgresqlDatabase{
+			BackupType: postgresql.PostgresBackupTypePgDump,
+			CpuCount:   1,
+		},
+	}
+
+	testResp := test_utils.MakePostRequest(
+		t,
+		router,
+		"/api/v1/databases/create",
+		"Bearer "+owner.Token,
+		request,
+		http.StatusBadRequest,
+	)
+
+	assert.Contains(t, string(testResp.Body), "host is required")
 }
 
 func Test_UpdateDatabase_PermissionsEnforced(t *testing.T) {
@@ -203,8 +250,10 @@ func Test_UpdateDatabase_PermissionsEnforced(t *testing.T) {
 			router := createTestRouter()
 			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+			defer RemoveTestDatabase(database)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -214,7 +263,13 @@ func Test_UpdateDatabase_PermissionsEnforced(t *testing.T) {
 				testUserToken = owner.Token
 			} else if tt.workspaceRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			}
 
@@ -244,8 +299,10 @@ func Test_UpdateDatabase_WhenUserIsNotWorkspaceMember_ReturnsForbidden(t *testin
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(database)
 
 	nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	database.Name = "Hacked Name"
@@ -260,6 +317,52 @@ func Test_UpdateDatabase_WhenUserIsNotWorkspaceMember_ReturnsForbidden(t *testin
 	)
 
 	assert.Contains(t, string(testResp.Body), "insufficient permissions")
+}
+
+func Test_UpdateDatabase_WhenDatabaseTypeChanged_ReturnsBadRequest(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(database)
+
+	database.Type = DatabaseTypeMysql
+
+	testResp := test_utils.MakePostRequest(
+		t,
+		router,
+		"/api/v1/databases/update",
+		"Bearer "+owner.Token,
+		database,
+		http.StatusBadRequest,
+	)
+
+	assert.Contains(t, string(testResp.Body), "database type cannot be changed")
+}
+
+func Test_UpdateDatabase_WhenBackupTypeChanged_ReturnsBadRequest(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(database)
+
+	database.Postgresql.BackupType = postgresql.PostgresBackupTypeWalV1
+
+	testResp := test_utils.MakePostRequest(
+		t,
+		router,
+		"/api/v1/databases/update",
+		"Bearer "+owner.Token,
+		database,
+		http.StatusBadRequest,
+	)
+
+	assert.Contains(t, string(testResp.Body), "backup type cannot be changed")
 }
 
 func Test_DeleteDatabase_PermissionsEnforced(t *testing.T) {
@@ -305,6 +408,7 @@ func Test_DeleteDatabase_PermissionsEnforced(t *testing.T) {
 			router := createTestRouter()
 			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
 
@@ -316,7 +420,13 @@ func Test_DeleteDatabase_PermissionsEnforced(t *testing.T) {
 				testUserToken = owner.Token
 			} else if tt.workspaceRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			}
 
@@ -329,6 +439,7 @@ func Test_DeleteDatabase_PermissionsEnforced(t *testing.T) {
 			)
 
 			if !tt.expectSuccess {
+				defer RemoveTestDatabase(database)
 				assert.Contains(t, string(testResp.Body), "insufficient permissions")
 			}
 		})
@@ -372,8 +483,10 @@ func Test_GetDatabase_PermissionsEnforced(t *testing.T) {
 			router := createTestRouter()
 			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+			defer RemoveTestDatabase(database)
 
 			var testUser string
 			if tt.isGlobalAdmin {
@@ -381,7 +494,13 @@ func Test_GetDatabase_PermissionsEnforced(t *testing.T) {
 				testUser = admin.Token
 			} else if tt.userRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.userRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.userRole,
+					owner.Token,
+					router,
+				)
 				testUser = member.Token
 			} else {
 				nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
@@ -444,9 +563,12 @@ func Test_GetDatabasesByWorkspace_PermissionsEnforced(t *testing.T) {
 			router := createTestRouter()
 			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
-			createTestDatabaseViaAPI("Database 1", workspace.ID, owner.Token, router)
-			createTestDatabaseViaAPI("Database 2", workspace.ID, owner.Token, router)
+			db1 := createTestDatabaseViaAPI("Database 1", workspace.ID, owner.Token, router)
+			defer RemoveTestDatabase(db1)
+			db2 := createTestDatabaseViaAPI("Database 2", workspace.ID, owner.Token, router)
+			defer RemoveTestDatabase(db2)
 
 			var testUser string
 			if tt.isGlobalAdmin {
@@ -488,10 +610,14 @@ func Test_GetDatabasesByWorkspace_WhenMultipleDatabasesExist_ReturnsCorrectCount
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
-	createTestDatabaseViaAPI("Database 1", workspace.ID, owner.Token, router)
-	createTestDatabaseViaAPI("Database 2", workspace.ID, owner.Token, router)
-	createTestDatabaseViaAPI("Database 3", workspace.ID, owner.Token, router)
+	db1 := createTestDatabaseViaAPI("Database 1", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(db1)
+	db2 := createTestDatabaseViaAPI("Database 2", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(db2)
+	db3 := createTestDatabaseViaAPI("Database 3", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(db3)
 
 	var response []Database
 	test_utils.MakeGetRequestAndUnmarshal(
@@ -510,14 +636,19 @@ func Test_GetDatabasesByWorkspace_EnsuresCrossWorkspaceIsolation(t *testing.T) {
 	router := createTestRouter()
 	owner1 := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace1 := workspaces_testing.CreateTestWorkspace("Workspace 1", owner1, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace1, router)
 
 	owner2 := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace2 := workspaces_testing.CreateTestWorkspace("Workspace 2", owner2, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace2, router)
 
-	createTestDatabaseViaAPI("Workspace1 DB1", workspace1.ID, owner1.Token, router)
-	createTestDatabaseViaAPI("Workspace1 DB2", workspace1.ID, owner1.Token, router)
+	workspace1Db1 := createTestDatabaseViaAPI("Workspace1 DB1", workspace1.ID, owner1.Token, router)
+	defer RemoveTestDatabase(workspace1Db1)
+	workspace1Db2 := createTestDatabaseViaAPI("Workspace1 DB2", workspace1.ID, owner1.Token, router)
+	defer RemoveTestDatabase(workspace1Db2)
 
-	createTestDatabaseViaAPI("Workspace2 DB1", workspace2.ID, owner2.Token, router)
+	workspace2Db1 := createTestDatabaseViaAPI("Workspace2 DB1", workspace2.ID, owner2.Token, router)
+	defer RemoveTestDatabase(workspace2Db1)
 
 	var workspace1Dbs []Database
 	test_utils.MakeGetRequestAndUnmarshal(
@@ -594,8 +725,10 @@ func Test_CopyDatabase_PermissionsEnforced(t *testing.T) {
 			router := createTestRouter()
 			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+			defer RemoveTestDatabase(database)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -605,7 +738,13 @@ func Test_CopyDatabase_PermissionsEnforced(t *testing.T) {
 				testUserToken = owner.Token
 			} else if tt.workspaceRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			}
 
@@ -621,6 +760,7 @@ func Test_CopyDatabase_PermissionsEnforced(t *testing.T) {
 			)
 
 			if tt.expectSuccess {
+				defer RemoveTestDatabase(&response)
 				assert.NotEqual(t, database.ID, response.ID)
 				assert.Contains(t, response.Name, "(Copy)")
 			} else {
@@ -634,8 +774,10 @@ func Test_CopyDatabase_CopyStaysInSameWorkspace(t *testing.T) {
 	router := createTestRouter()
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(database)
 
 	var response Database
 	test_utils.MakePostRequestAndUnmarshal(
@@ -648,131 +790,12 @@ func Test_CopyDatabase_CopyStaysInSameWorkspace(t *testing.T) {
 		&response,
 	)
 
+	defer RemoveTestDatabase(&response)
+
 	assert.NotEqual(t, database.ID, response.ID)
 	assert.Equal(t, "Test Database (Copy)", response.Name)
 	assert.Equal(t, workspace.ID, *response.WorkspaceID)
 	assert.Equal(t, database.Type, response.Type)
-}
-
-func Test_TestConnection_PermissionsEnforced(t *testing.T) {
-	tests := []struct {
-		name                    string
-		isMember                bool
-		isGlobalAdmin           bool
-		expectAccessGranted     bool
-		expectedStatusCodeOnErr int
-	}{
-		{
-			name:                    "workspace member can test connection",
-			isMember:                true,
-			isGlobalAdmin:           false,
-			expectAccessGranted:     true,
-			expectedStatusCodeOnErr: http.StatusBadRequest,
-		},
-		{
-			name:                    "non-member cannot test connection",
-			isMember:                false,
-			isGlobalAdmin:           false,
-			expectAccessGranted:     false,
-			expectedStatusCodeOnErr: http.StatusBadRequest,
-		},
-		{
-			name:                    "global admin can test connection",
-			isMember:                false,
-			isGlobalAdmin:           true,
-			expectAccessGranted:     true,
-			expectedStatusCodeOnErr: http.StatusBadRequest,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			router := createTestRouter()
-			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
-			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
-
-			database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
-
-			var testUser string
-			if tt.isGlobalAdmin {
-				admin := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
-				testUser = admin.Token
-			} else if tt.isMember {
-				testUser = owner.Token
-			} else {
-				nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				testUser = nonMember.Token
-			}
-
-			w := workspaces_testing.MakeAPIRequest(
-				router,
-				"POST",
-				"/api/v1/databases/"+database.ID.String()+"/test-connection",
-				"Bearer "+testUser,
-				nil,
-			)
-
-			body := w.Body.String()
-
-			if tt.expectAccessGranted {
-				assert.True(
-					t,
-					w.Code == http.StatusOK ||
-						(w.Code == http.StatusBadRequest && strings.Contains(body, "connect")),
-					"Expected 200 OK or 400 with connection error, got %d: %s",
-					w.Code,
-					body,
-				)
-			} else {
-				assert.Equal(t, tt.expectedStatusCodeOnErr, w.Code)
-				assert.Contains(t, body, "insufficient permissions")
-			}
-		})
-	}
-}
-
-func createTestDatabaseViaAPI(
-	name string,
-	workspaceID uuid.UUID,
-	token string,
-	router *gin.Engine,
-) *Database {
-	testDbName := "test_db"
-	request := Database{
-		Name:        name,
-		WorkspaceID: &workspaceID,
-		Type:        DatabaseTypePostgres,
-		Postgresql: &postgresql.PostgresqlDatabase{
-			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
-			Port:     5432,
-			Username: "postgres",
-			Password: "postgres",
-			Database: &testDbName,
-			CpuCount: 1,
-		},
-	}
-
-	w := workspaces_testing.MakeAPIRequest(
-		router,
-		"POST",
-		"/api/v1/databases/create",
-		"Bearer "+token,
-		request,
-	)
-
-	if w.Code != http.StatusCreated {
-		panic(
-			fmt.Sprintf("Failed to create database. Status: %d, Body: %s", w.Code, w.Body.String()),
-		)
-	}
-
-	var database Database
-	if err := json.Unmarshal(w.Body.Bytes(), &database); err != nil {
-		panic(err)
-	}
-
-	return &database
 }
 
 func Test_CreateDatabase_PasswordIsEncryptedInDB(t *testing.T) {
@@ -780,21 +803,14 @@ func Test_CreateDatabase_PasswordIsEncryptedInDB(t *testing.T) {
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
 
-	testDbName := "test_db"
-	plainPassword := "my-super-secret-password-123"
+	pgConfig := getTestPostgresConfig()
+	plainPassword := "testpassword"
+	pgConfig.Password = plainPassword
 	request := Database{
 		Name:        "Test Database",
 		WorkspaceID: &workspace.ID,
 		Type:        DatabaseTypePostgres,
-		Postgresql: &postgresql.PostgresqlDatabase{
-			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
-			Port:     5432,
-			Username: "postgres",
-			Password: plainPassword,
-			Database: &testDbName,
-			CpuCount: 1,
-		},
+		Postgresql:  pgConfig,
 	}
 
 	var createdDatabase Database
@@ -846,7 +862,7 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 		name                string
 		databaseType        DatabaseType
 		createDatabase      func(workspaceID uuid.UUID) *Database
-		updateDatabase      func(workspaceID uuid.UUID, databaseID uuid.UUID) *Database
+		updateDatabase      func(workspaceID, databaseID uuid.UUID) *Database
 		verifySensitiveData func(t *testing.T, database *Database)
 		verifyHiddenData    func(t *testing.T, database *Database)
 	}{
@@ -854,38 +870,23 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 			name:         "PostgreSQL Database",
 			databaseType: DatabaseTypePostgres,
 			createDatabase: func(workspaceID uuid.UUID) *Database {
-				testDbName := "test_db"
+				pgConfig := getTestPostgresConfig()
 				return &Database{
 					WorkspaceID: &workspaceID,
 					Name:        "Test PostgreSQL Database",
 					Type:        DatabaseTypePostgres,
-					Postgresql: &postgresql.PostgresqlDatabase{
-						Version:  tools.PostgresqlVersion16,
-						Host:     "localhost",
-						Port:     5432,
-						Username: "postgres",
-						Password: "original-password-secret",
-						Database: &testDbName,
-						CpuCount: 1,
-					},
+					Postgresql:  pgConfig,
 				}
 			},
-			updateDatabase: func(workspaceID uuid.UUID, databaseID uuid.UUID) *Database {
-				testDbName := "updated_test_db"
+			updateDatabase: func(workspaceID, databaseID uuid.UUID) *Database {
+				pgConfig := getTestPostgresConfig()
+				pgConfig.Password = ""
 				return &Database{
 					ID:          databaseID,
 					WorkspaceID: &workspaceID,
 					Name:        "Updated PostgreSQL Database",
 					Type:        DatabaseTypePostgres,
-					Postgresql: &postgresql.PostgresqlDatabase{
-						Version:  tools.PostgresqlVersion17,
-						Host:     "updated-host",
-						Port:     5433,
-						Username: "updated_user",
-						Password: "",
-						Database: &testDbName,
-						CpuCount: 1,
-					},
+					Postgresql:  pgConfig,
 				}
 			},
 			verifySensitiveData: func(t *testing.T, database *Database) {
@@ -895,7 +896,7 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 				encryptor := encryption.GetFieldEncryptor()
 				decrypted, err := encryptor.Decrypt(database.ID, database.Postgresql.Password)
 				assert.NoError(t, err)
-				assert.Equal(t, "original-password-secret", decrypted)
+				assert.Equal(t, "testpassword", decrypted)
 			},
 			verifyHiddenData: func(t *testing.T, database *Database) {
 				assert.Equal(t, "", database.Postgresql.Password)
@@ -905,36 +906,23 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 			name:         "MariaDB Database",
 			databaseType: DatabaseTypeMariadb,
 			createDatabase: func(workspaceID uuid.UUID) *Database {
-				testDbName := "test_db"
+				mariaConfig := getTestMariadbConfig()
 				return &Database{
 					WorkspaceID: &workspaceID,
 					Name:        "Test MariaDB Database",
 					Type:        DatabaseTypeMariadb,
-					Mariadb: &mariadb.MariadbDatabase{
-						Version:  tools.MariadbVersion1011,
-						Host:     "localhost",
-						Port:     3306,
-						Username: "root",
-						Password: "original-password-secret",
-						Database: &testDbName,
-					},
+					Mariadb:     mariaConfig,
 				}
 			},
-			updateDatabase: func(workspaceID uuid.UUID, databaseID uuid.UUID) *Database {
-				testDbName := "updated_test_db"
+			updateDatabase: func(workspaceID, databaseID uuid.UUID) *Database {
+				mariaConfig := getTestMariadbConfig()
+				mariaConfig.Password = ""
 				return &Database{
 					ID:          databaseID,
 					WorkspaceID: &workspaceID,
 					Name:        "Updated MariaDB Database",
 					Type:        DatabaseTypeMariadb,
-					Mariadb: &mariadb.MariadbDatabase{
-						Version:  tools.MariadbVersion114,
-						Host:     "updated-host",
-						Port:     3307,
-						Username: "updated_user",
-						Password: "",
-						Database: &testDbName,
-					},
+					Mariadb:     mariaConfig,
 				}
 			},
 			verifySensitiveData: func(t *testing.T, database *Database) {
@@ -944,7 +932,7 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 				encryptor := encryption.GetFieldEncryptor()
 				decrypted, err := encryptor.Decrypt(database.ID, database.Mariadb.Password)
 				assert.NoError(t, err)
-				assert.Equal(t, "original-password-secret", decrypted)
+				assert.Equal(t, "testpassword", decrypted)
 			},
 			verifyHiddenData: func(t *testing.T, database *Database) {
 				assert.Equal(t, "", database.Mariadb.Password)
@@ -954,40 +942,23 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 			name:         "MongoDB Database",
 			databaseType: DatabaseTypeMongodb,
 			createDatabase: func(workspaceID uuid.UUID) *Database {
+				mongoConfig := getTestMongodbConfig()
 				return &Database{
 					WorkspaceID: &workspaceID,
 					Name:        "Test MongoDB Database",
 					Type:        DatabaseTypeMongodb,
-					Mongodb: &mongodb.MongodbDatabase{
-						Version:      tools.MongodbVersion7,
-						Host:         "localhost",
-						Port:         27017,
-						Username:     "root",
-						Password:     "original-password-secret",
-						Database:     "test_db",
-						AuthDatabase: "admin",
-						IsHttps:      false,
-						CpuCount:     1,
-					},
+					Mongodb:     mongoConfig,
 				}
 			},
-			updateDatabase: func(workspaceID uuid.UUID, databaseID uuid.UUID) *Database {
+			updateDatabase: func(workspaceID, databaseID uuid.UUID) *Database {
+				mongoConfig := getTestMongodbConfig()
+				mongoConfig.Password = ""
 				return &Database{
 					ID:          databaseID,
 					WorkspaceID: &workspaceID,
 					Name:        "Updated MongoDB Database",
 					Type:        DatabaseTypeMongodb,
-					Mongodb: &mongodb.MongodbDatabase{
-						Version:      tools.MongodbVersion8,
-						Host:         "updated-host",
-						Port:         27018,
-						Username:     "updated_user",
-						Password:     "",
-						Database:     "updated_test_db",
-						AuthDatabase: "admin",
-						IsHttps:      false,
-						CpuCount:     1,
-					},
+					Mongodb:     mongoConfig,
 				}
 			},
 			verifySensitiveData: func(t *testing.T, database *Database) {
@@ -997,7 +968,7 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 				encryptor := encryption.GetFieldEncryptor()
 				decrypted, err := encryptor.Decrypt(database.ID, database.Mongodb.Password)
 				assert.NoError(t, err)
-				assert.Equal(t, "original-password-secret", decrypted)
+				assert.Equal(t, "rootpassword", decrypted)
 			},
 			verifyHiddenData: func(t *testing.T, database *Database) {
 				assert.Equal(t, "", database.Mongodb.Password)
@@ -1106,5 +1077,437 @@ func Test_DatabaseSensitiveDataLifecycle_AllTypes(t *testing.T) {
 
 			workspaces_testing.RemoveTestWorkspace(workspace, router)
 		})
+	}
+}
+
+func Test_TestConnection_PermissionsEnforced(t *testing.T) {
+	tests := []struct {
+		name                    string
+		isMember                bool
+		isGlobalAdmin           bool
+		expectAccessGranted     bool
+		expectedStatusCodeOnErr int
+	}{
+		{
+			name:                    "workspace member can test connection",
+			isMember:                true,
+			isGlobalAdmin:           false,
+			expectAccessGranted:     true,
+			expectedStatusCodeOnErr: http.StatusBadRequest,
+		},
+		{
+			name:                    "non-member cannot test connection",
+			isMember:                false,
+			isGlobalAdmin:           false,
+			expectAccessGranted:     false,
+			expectedStatusCodeOnErr: http.StatusBadRequest,
+		},
+		{
+			name:                    "global admin can test connection",
+			isMember:                false,
+			isGlobalAdmin:           true,
+			expectAccessGranted:     true,
+			expectedStatusCodeOnErr: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := createTestRouter()
+			owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+			workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+			database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+			defer RemoveTestDatabase(database)
+
+			var testUser string
+			if tt.isGlobalAdmin {
+				admin := users_testing.CreateTestUser(users_enums.UserRoleAdmin)
+				testUser = admin.Token
+			} else if tt.isMember {
+				testUser = owner.Token
+			} else {
+				nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
+				testUser = nonMember.Token
+			}
+
+			w := workspaces_testing.MakeAPIRequest(
+				router,
+				"POST",
+				"/api/v1/databases/"+database.ID.String()+"/test-connection",
+				"Bearer "+testUser,
+				nil,
+			)
+
+			body := w.Body.String()
+
+			if tt.expectAccessGranted {
+				assert.True(
+					t,
+					w.Code == http.StatusOK ||
+						(w.Code == http.StatusBadRequest && strings.Contains(body, "connect")),
+					"Expected 200 OK or 400 with connection error, got %d: %s",
+					w.Code,
+					body,
+				)
+			} else {
+				assert.Equal(t, tt.expectedStatusCodeOnErr, w.Code)
+				assert.Contains(t, body, "insufficient permissions")
+			}
+		})
+	}
+}
+
+func Test_RegenerateAgentToken_ReturnsToken(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(database)
+
+	var response map[string]string
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/databases/"+database.ID.String()+"/regenerate-token",
+		"Bearer "+owner.Token,
+		nil,
+		http.StatusOK,
+		&response,
+	)
+
+	assert.NotEmpty(t, response["token"])
+	assert.Len(t, response["token"], 32)
+
+	var updatedDatabase Database
+	test_utils.MakeGetRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/databases/"+database.ID.String(),
+		"Bearer "+owner.Token,
+		http.StatusOK,
+		&updatedDatabase,
+	)
+	assert.True(t, updatedDatabase.IsAgentTokenGenerated)
+}
+
+func Test_VerifyAgentToken_WithValidToken_Succeeds(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database := createTestDatabaseViaAPI("Test Database", workspace.ID, owner.Token, router)
+	defer RemoveTestDatabase(database)
+
+	var regenerateResponse map[string]string
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/databases/"+database.ID.String()+"/regenerate-token",
+		"Bearer "+owner.Token,
+		nil,
+		http.StatusOK,
+		&regenerateResponse,
+	)
+
+	token := regenerateResponse["token"]
+	assert.NotEmpty(t, token)
+
+	w := workspaces_testing.MakeAPIRequest(
+		router,
+		"POST",
+		"/api/v1/databases/verify-token",
+		"",
+		VerifyAgentTokenRequest{Token: token},
+	)
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+func Test_VerifyAgentToken_WithInvalidToken_Returns401(t *testing.T) {
+	router := createTestRouter()
+
+	w := workspaces_testing.MakeAPIRequest(
+		router,
+		"POST",
+		"/api/v1/databases/verify-token",
+		"",
+		VerifyAgentTokenRequest{Token: "invalidtoken00000000000000000000"},
+	)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func createTestDatabaseViaAPI(
+	name string,
+	workspaceID uuid.UUID,
+	token string,
+	router *gin.Engine,
+) *Database {
+	env := config.GetEnv()
+	port, err := strconv.Atoi(env.TestPostgres16Port)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse TEST_POSTGRES_16_PORT: %v", err))
+	}
+
+	testDbName := "testdb"
+	request := Database{
+		Name:        name,
+		WorkspaceID: &workspaceID,
+		Type:        DatabaseTypePostgres,
+		Postgresql: &postgresql.PostgresqlDatabase{
+			Version:  tools.PostgresqlVersion16,
+			Host:     config.GetEnv().TestLocalhost,
+			Port:     port,
+			Username: "testuser",
+			Password: "testpassword",
+			Database: &testDbName,
+			CpuCount: 1,
+		},
+	}
+
+	w := workspaces_testing.MakeAPIRequest(
+		router,
+		"POST",
+		"/api/v1/databases/create",
+		"Bearer "+token,
+		request,
+	)
+
+	if w.Code != http.StatusCreated {
+		panic(
+			fmt.Sprintf("Failed to create database. Status: %d, Body: %s", w.Code, w.Body.String()),
+		)
+	}
+
+	var database Database
+	if err := json.Unmarshal(w.Body.Bytes(), &database); err != nil {
+		panic(err)
+	}
+
+	return &database
+}
+
+func createTestRouter() *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+
+	v1 := router.Group("/api/v1")
+	protected := v1.Group("").Use(users_middleware.AuthMiddleware(users_services.GetUserService()))
+
+	workspaces_controllers.GetWorkspaceController().RegisterRoutes(protected.(*gin.RouterGroup))
+	workspaces_controllers.GetMembershipController().RegisterRoutes(protected.(*gin.RouterGroup))
+	GetDatabaseController().RegisterRoutes(protected.(*gin.RouterGroup))
+
+	GetDatabaseController().RegisterPublicRoutes(v1)
+
+	audit_logs.SetupDependencies()
+
+	return router
+}
+
+func getTestPostgresConfig() *postgresql.PostgresqlDatabase {
+	env := config.GetEnv()
+	port, err := strconv.Atoi(env.TestPostgres16Port)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse TEST_POSTGRES_16_PORT: %v", err))
+	}
+
+	testDbName := "testdb"
+	return &postgresql.PostgresqlDatabase{
+		BackupType: postgresql.PostgresBackupTypePgDump,
+		Version:    tools.PostgresqlVersion16,
+		Host:       config.GetEnv().TestLocalhost,
+		Port:       port,
+		Username:   "testuser",
+		Password:   "testpassword",
+		Database:   &testDbName,
+		CpuCount:   1,
+	}
+}
+
+func Test_CreateDatabase_WhenCloudAndUserIsNotReadOnly_ReturnsBadRequest(t *testing.T) {
+	enableCloud(t)
+
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Cloud Not ReadOnly", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	request := Database{
+		Name:        "Cloud Non-ReadOnly DB",
+		WorkspaceID: &workspace.ID,
+		Type:        DatabaseTypePostgres,
+		Postgresql:  getTestPostgresConfig(),
+	}
+
+	resp := test_utils.MakePostRequest(
+		t,
+		router,
+		"/api/v1/databases/create",
+		"Bearer "+owner.Token,
+		request,
+		http.StatusBadRequest,
+	)
+
+	assert.Contains(t, string(resp.Body), "in cloud mode, only read-only database users are allowed")
+}
+
+func Test_CreateDatabase_WhenCloudAndUserIsReadOnly_DatabaseCreated(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Cloud ReadOnly", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	database := createTestDatabaseViaAPI("Temp DB for RO User", workspace.ID, owner.Token, router)
+
+	readOnlyUser := createReadOnlyUserViaAPI(t, router, database.ID, owner.Token)
+	assert.NotEmpty(t, readOnlyUser.Username)
+	assert.NotEmpty(t, readOnlyUser.Password)
+
+	RemoveTestDatabase(database)
+
+	enableCloud(t)
+
+	pgConfig := getTestPostgresConfig()
+	pgConfig.Username = readOnlyUser.Username
+	pgConfig.Password = readOnlyUser.Password
+
+	request := Database{
+		Name:        "Cloud ReadOnly DB",
+		WorkspaceID: &workspace.ID,
+		Type:        DatabaseTypePostgres,
+		Postgresql:  pgConfig,
+	}
+
+	var response Database
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/databases/create",
+		"Bearer "+owner.Token,
+		request,
+		http.StatusCreated,
+		&response,
+	)
+	defer RemoveTestDatabase(&response)
+
+	assert.Equal(t, "Cloud ReadOnly DB", response.Name)
+	assert.NotEqual(t, uuid.Nil, response.ID)
+}
+
+func Test_CreateDatabase_WhenNotCloudAndUserIsNotReadOnly_DatabaseCreated(t *testing.T) {
+	router := createTestRouter()
+	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
+	workspace := workspaces_testing.CreateTestWorkspace("Non-Cloud", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
+	request := Database{
+		Name:        "Non-Cloud DB",
+		WorkspaceID: &workspace.ID,
+		Type:        DatabaseTypePostgres,
+		Postgresql:  getTestPostgresConfig(),
+	}
+
+	var response Database
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/databases/create",
+		"Bearer "+owner.Token,
+		request,
+		http.StatusCreated,
+		&response,
+	)
+	defer RemoveTestDatabase(&response)
+
+	assert.Equal(t, "Non-Cloud DB", response.Name)
+	assert.NotEqual(t, uuid.Nil, response.ID)
+}
+
+func enableCloud(t *testing.T) {
+	t.Helper()
+	config.GetEnv().IsCloud = true
+	t.Cleanup(func() {
+		config.GetEnv().IsCloud = false
+	})
+}
+
+func createReadOnlyUserViaAPI(
+	t *testing.T,
+	router *gin.Engine,
+	databaseID uuid.UUID,
+	token string,
+) *CreateReadOnlyUserResponse {
+	var database Database
+	test_utils.MakeGetRequestAndUnmarshal(
+		t,
+		router,
+		fmt.Sprintf("/api/v1/databases/%s", databaseID.String()),
+		"Bearer "+token,
+		http.StatusOK,
+		&database,
+	)
+
+	var response CreateReadOnlyUserResponse
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/databases/create-readonly-user",
+		"Bearer "+token,
+		database,
+		http.StatusOK,
+		&response,
+	)
+
+	return &response
+}
+
+func getTestMariadbConfig() *mariadb.MariadbDatabase {
+	env := config.GetEnv()
+	portStr := env.TestMariadb1011Port
+	if portStr == "" {
+		portStr = "33111"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse TEST_MARIADB_1011_PORT: %v", err))
+	}
+
+	testDbName := "testdb"
+	return &mariadb.MariadbDatabase{
+		Version:  tools.MariadbVersion1011,
+		Host:     config.GetEnv().TestLocalhost,
+		Port:     port,
+		Username: "testuser",
+		Password: "testpassword",
+		Database: &testDbName,
+	}
+}
+
+func getTestMongodbConfig() *mongodb.MongodbDatabase {
+	env := config.GetEnv()
+	portStr := env.TestMongodb70Port
+	if portStr == "" {
+		portStr = "27070"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse TEST_MONGODB_70_PORT: %v", err))
+	}
+
+	return &mongodb.MongodbDatabase{
+		Version:      tools.MongodbVersion7,
+		Host:         config.GetEnv().TestLocalhost,
+		Port:         &port,
+		Username:     "root",
+		Password:     "rootpassword",
+		Database:     "testdb",
+		AuthDatabase: "admin",
+		IsHttps:      false,
+		IsSrv:        false,
+		CpuCount:     1,
 	}
 }

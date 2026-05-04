@@ -18,16 +18,15 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"databasus-backend/internal/config"
-	"databasus-backend/internal/features/backups/backups"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	"databasus-backend/internal/features/backups/backups/encryption"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	mariadbtypes "databasus-backend/internal/features/databases/databases/mariadb"
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
-	"databasus-backend/internal/features/restores/models"
+	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	util_encryption "databasus-backend/internal/util/encryption"
-	files_utils "databasus-backend/internal/util/files"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -37,11 +36,12 @@ type RestoreMariadbBackupUsecase struct {
 }
 
 func (uc *RestoreMariadbBackupUsecase) Execute(
+	parentCtx context.Context,
 	originalDB *databases.Database,
 	restoringToDB *databases.Database,
 	backupConfig *backups_config.BackupConfig,
-	restore models.Restore,
-	backup *backups.Backup,
+	restore restores_core.Restore,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 ) error {
 	if originalDB.Type != databases.DatabaseTypeMariadb {
@@ -70,8 +70,23 @@ func (uc *RestoreMariadbBackupUsecase) Execute(
 		"--verbose",
 	}
 
+	// Disable Galera Cluster replication for the restore session to prevent
+	// "Maximum writeset size exceeded" errors on large restores.
+	// wsrep_on is available in MariaDB 10.1+ (all builds with Galera support).
+	// On non-Galera instances the variable still exists but is a no-op.
+	if mdb.Version != tools.MariadbVersion55 {
+		args = append(args, "--init-command=SET SESSION wsrep_on=OFF")
+	}
+
+	if !config.GetEnv().IsCloud {
+		args = append(args, "--max-allowed-packet=1G")
+	}
+
 	if mdb.IsHttps {
 		args = append(args, "--ssl")
+		args = append(args, "--skip-ssl-verify-server-cert")
+	} else {
+		args = append(args, "--skip-ssl")
 	}
 
 	if mdb.Database != nil && *mdb.Database != "" {
@@ -79,13 +94,9 @@ func (uc *RestoreMariadbBackupUsecase) Execute(
 	}
 
 	return uc.restoreFromStorage(
+		parentCtx,
 		originalDB,
-		tools.GetMariadbExecutable(
-			tools.MariadbExecutableMariadb,
-			mdb.Version,
-			config.GetEnv().EnvMode,
-			config.GetEnv().MariadbInstallDir,
-		),
+		tools.GetMariadbExecutable(mdb.Version, tools.MariadbExecutableMariadb),
 		args,
 		mdb.Password,
 		backup,
@@ -95,15 +106,16 @@ func (uc *RestoreMariadbBackupUsecase) Execute(
 }
 
 func (uc *RestoreMariadbBackupUsecase) restoreFromStorage(
+	parentCtx context.Context,
 	database *databases.Database,
 	mariadbBin string,
 	args []string,
 	password string,
-	backup *backups.Backup,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 	mdbConfig *mariadbtypes.MariadbDatabase,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	ctx, cancel := context.WithTimeout(parentCtx, 23*time.Hour)
 	defer cancel()
 
 	go func() {
@@ -112,6 +124,9 @@ func (uc *RestoreMariadbBackupUsecase) restoreFromStorage(
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-parentCtx.Done():
+				cancel()
 				return
 			case <-ticker.C:
 				if config.IsShouldShutdown() {
@@ -134,11 +149,16 @@ func (uc *RestoreMariadbBackupUsecase) restoreFromStorage(
 	}
 	defer func() { _ = os.RemoveAll(filepath.Dir(myCnfFile)) }()
 
-	tempBackupFile, cleanupFunc, err := uc.downloadBackupToTempFile(ctx, backup, storage)
+	// Stream backup directly from storage
+	rawReader, err := storage.GetFile(fieldEncryptor, backup.FileName)
 	if err != nil {
-		return fmt.Errorf("failed to download backup: %w", err)
+		return fmt.Errorf("failed to get backup file from storage: %w", err)
 	}
-	defer cleanupFunc()
+	defer func() {
+		if err := rawReader.Close(); err != nil {
+			uc.logger.Error("Failed to close backup reader", "error", err)
+		}
+	}()
 
 	return uc.executeMariadbRestore(
 		ctx,
@@ -146,7 +166,7 @@ func (uc *RestoreMariadbBackupUsecase) restoreFromStorage(
 		mariadbBin,
 		args,
 		myCnfFile,
-		tempBackupFile,
+		rawReader,
 		backup,
 	)
 }
@@ -157,24 +177,18 @@ func (uc *RestoreMariadbBackupUsecase) executeMariadbRestore(
 	mariadbBin string,
 	args []string,
 	myCnfFile string,
-	backupFile string,
-	backup *backups.Backup,
+	backupReader io.ReadCloser,
+	backup *backups_core.Backup,
 ) error {
 	fullArgs := append([]string{"--defaults-file=" + myCnfFile}, args...)
 
 	cmd := exec.CommandContext(ctx, mariadbBin, fullArgs...)
 	uc.logger.Info("Executing MariaDB restore command", "command", cmd.String())
 
-	backupFileHandle, err := os.Open(backupFile)
-	if err != nil {
-		return fmt.Errorf("failed to open backup file: %w", err)
-	}
-	defer func() { _ = backupFileHandle.Close() }()
-
-	var inputReader io.Reader = backupFileHandle
+	var inputReader io.Reader = backupReader
 
 	if backup.Encryption == backups_config.BackupEncryptionEncrypted {
-		decryptReader, err := uc.setupDecryption(backupFileHandle, backup)
+		decryptReader, err := uc.setupDecryption(backupReader, backup)
 		if err != nil {
 			return fmt.Errorf("failed to setup decryption: %w", err)
 		}
@@ -214,6 +228,15 @@ func (uc *RestoreMariadbBackupUsecase) executeMariadbRestore(
 	waitErr := cmd.Wait()
 	stderrOutput := <-stderrCh
 
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return fmt.Errorf("restore cancelled")
+		}
+	default:
+	}
+
 	if config.IsShouldShutdown() {
 		return fmt.Errorf("restore cancelled due to shutdown")
 	}
@@ -225,72 +248,9 @@ func (uc *RestoreMariadbBackupUsecase) executeMariadbRestore(
 	return nil
 }
 
-func (uc *RestoreMariadbBackupUsecase) downloadBackupToTempFile(
-	ctx context.Context,
-	backup *backups.Backup,
-	storage *storages.Storage,
-) (string, func(), error) {
-	err := files_utils.EnsureDirectories([]string{
-		config.GetEnv().TempFolder,
-	})
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to ensure directories: %w", err)
-	}
-
-	tempDir, err := os.MkdirTemp(config.GetEnv().TempFolder, "restore_"+uuid.New().String())
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to create temporary directory: %w", err)
-	}
-
-	cleanupFunc := func() {
-		_ = os.RemoveAll(tempDir)
-	}
-
-	tempBackupFile := filepath.Join(tempDir, "backup.sql.zst")
-
-	uc.logger.Info(
-		"Downloading backup file from storage to temporary file",
-		"backupId", backup.ID,
-		"tempFile", tempBackupFile,
-		"encrypted", backup.Encryption == backups_config.BackupEncryptionEncrypted,
-	)
-
-	fieldEncryptor := util_encryption.GetFieldEncryptor()
-	rawReader, err := storage.GetFile(fieldEncryptor, backup.ID)
-	if err != nil {
-		cleanupFunc()
-		return "", nil, fmt.Errorf("failed to get backup file from storage: %w", err)
-	}
-	defer func() {
-		if err := rawReader.Close(); err != nil {
-			uc.logger.Error("Failed to close backup reader", "error", err)
-		}
-	}()
-
-	tempFile, err := os.Create(tempBackupFile)
-	if err != nil {
-		cleanupFunc()
-		return "", nil, fmt.Errorf("failed to create temporary backup file: %w", err)
-	}
-	defer func() {
-		if err := tempFile.Close(); err != nil {
-			uc.logger.Error("Failed to close temporary file", "error", err)
-		}
-	}()
-
-	_, err = uc.copyWithShutdownCheck(ctx, tempFile, rawReader)
-	if err != nil {
-		cleanupFunc()
-		return "", nil, fmt.Errorf("failed to write backup to temporary file: %w", err)
-	}
-
-	uc.logger.Info("Backup file written to temporary location", "tempFile", tempBackupFile)
-	return tempBackupFile, cleanupFunc, nil
-}
-
 func (uc *RestoreMariadbBackupUsecase) setupDecryption(
 	reader io.Reader,
-	backup *backups.Backup,
+	backup *backups_core.Backup,
 ) (io.Reader, error) {
 	if backup.EncryptionSalt == nil || backup.EncryptionIV == nil {
 		return nil, fmt.Errorf("backup is encrypted but missing encryption metadata")
@@ -330,9 +290,16 @@ func (uc *RestoreMariadbBackupUsecase) createTempMyCnfFile(
 	mdbConfig *mariadbtypes.MariadbDatabase,
 	password string,
 ) (string, error) {
-	tempDir, err := os.MkdirTemp("", "mycnf")
+	// Credential files use OS temp dir (/tmp) because some filesystems
+	// (e.g. ZFS on TrueNAS) ignore chmod, causing "group or world access" errors.
+	tempDir, err := os.MkdirTemp(os.TempDir(), "mycnf_"+uuid.New().String())
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	if err := os.Chmod(tempDir, 0o700); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return "", fmt.Errorf("failed to set temp directory permissions: %w", err)
 	}
 
 	myCnfFile := filepath.Join(tempDir, ".my.cnf")
@@ -350,63 +317,13 @@ port=%d
 		content += "ssl=false\n"
 	}
 
-	err = os.WriteFile(myCnfFile, []byte(content), 0600)
+	err = os.WriteFile(myCnfFile, []byte(content), 0o600)
 	if err != nil {
+		_ = os.RemoveAll(tempDir)
 		return "", fmt.Errorf("failed to write .my.cnf: %w", err)
 	}
 
 	return myCnfFile, nil
-}
-
-func (uc *RestoreMariadbBackupUsecase) copyWithShutdownCheck(
-	ctx context.Context,
-	dst io.Writer,
-	src io.Reader,
-) (int64, error) {
-	buf := make([]byte, 16*1024*1024)
-	var totalBytesWritten int64
-
-	for {
-		select {
-		case <-ctx.Done():
-			return totalBytesWritten, fmt.Errorf("copy cancelled: %w", ctx.Err())
-		default:
-		}
-
-		if config.IsShouldShutdown() {
-			return totalBytesWritten, fmt.Errorf("copy cancelled due to shutdown")
-		}
-
-		bytesRead, readErr := src.Read(buf)
-		if bytesRead > 0 {
-			bytesWritten, writeErr := dst.Write(buf[0:bytesRead])
-			if bytesWritten < 0 || bytesRead < bytesWritten {
-				bytesWritten = 0
-				if writeErr == nil {
-					writeErr = fmt.Errorf("invalid write result")
-				}
-			}
-
-			if writeErr != nil {
-				return totalBytesWritten, writeErr
-			}
-
-			if bytesRead != bytesWritten {
-				return totalBytesWritten, io.ErrShortWrite
-			}
-
-			totalBytesWritten += int64(bytesWritten)
-		}
-
-		if readErr != nil {
-			if readErr != io.EOF {
-				return totalBytesWritten, readErr
-			}
-			break
-		}
-	}
-
-	return totalBytesWritten, nil
 }
 
 func (uc *RestoreMariadbBackupUsecase) handleMariadbRestoreError(
@@ -461,6 +378,13 @@ func (uc *RestoreMariadbBackupUsecase) handleMariadbRestoreError(
 	if containsIgnoreCase(stderrStr, "timeout") {
 		return fmt.Errorf(
 			"MariaDB connection timeout. stderr: %s",
+			stderrStr,
+		)
+	}
+
+	if containsIgnoreCase(stderrStr, "writeset size exceeded") {
+		return fmt.Errorf(
+			"MariaDB Galera Cluster writeset size limit exceeded. Try increasing wsrep_max_ws_size on your cluster nodes. stderr: %s",
 			stderrStr,
 		)
 	}

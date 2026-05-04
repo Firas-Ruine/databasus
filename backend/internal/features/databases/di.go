@@ -1,6 +1,8 @@
 package databases
 
 import (
+	"sync"
+
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	"databasus-backend/internal/features/notifiers"
 	users_services "databasus-backend/internal/features/users/services"
@@ -37,6 +39,7 @@ func GetDatabaseController() *DatabaseController {
 	return databaseController
 }
 
-func SetupDependencies() {
+var SetupDependencies = sync.OnceFunc(func() {
 	workspaces_services.GetWorkspaceService().AddWorkspaceDeletionListener(databaseService)
-}
+	notifiers.GetNotifierService().SetNotifierDatabaseCounter(databaseService)
+})

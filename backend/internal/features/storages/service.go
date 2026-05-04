@@ -1,22 +1,54 @@
 package storages
 
 import (
-	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
+
+	"databasus-backend/internal/config"
 	audit_logs "databasus-backend/internal/features/audit_logs"
+	users_enums "databasus-backend/internal/features/users/enums"
 	users_models "databasus-backend/internal/features/users/models"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	"databasus-backend/internal/util/encryption"
-
-	"github.com/google/uuid"
 )
 
 type StorageService struct {
-	storageRepository *StorageRepository
-	workspaceService  *workspaces_services.WorkspaceService
-	auditLogService   *audit_logs.AuditLogService
-	fieldEncryptor    encryption.FieldEncryptor
+	storageRepository      *StorageRepository
+	workspaceService       *workspaces_services.WorkspaceService
+	auditLogService        *audit_logs.AuditLogService
+	fieldEncryptor         encryption.FieldEncryptor
+	storageDatabaseCounter StorageDatabaseCounter
+}
+
+func (s *StorageService) SetStorageDatabaseCounter(storageDatabaseCounter StorageDatabaseCounter) {
+	s.storageDatabaseCounter = storageDatabaseCounter
+}
+
+func (s *StorageService) OnBeforeWorkspaceDeletion(workspaceID uuid.UUID) error {
+	storages, err := s.storageRepository.FindByWorkspaceID(workspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to get storages for workspace deletion: %w", err)
+	}
+
+	for _, storage := range storages {
+		if storage.IsSystem && storage.WorkspaceID != workspaceID {
+			// skip system storage from another workspace
+			continue
+		}
+
+		if storage.IsSystem && storage.WorkspaceID == workspaceID {
+			return fmt.Errorf(
+				"system storage cannot be deleted due to workspace deletion, please transfer or remove storage first",
+			)
+		}
+
+		if err := s.storageRepository.Delete(storage); err != nil {
+			return fmt.Errorf("failed to delete storage %s: %w", storage.ID, err)
+		}
+	}
+
+	return nil
 }
 
 func (s *StorageService) SaveStorage(
@@ -29,10 +61,20 @@ func (s *StorageService) SaveStorage(
 		return err
 	}
 	if !canManage {
-		return errors.New("insufficient permissions to manage storage in this workspace")
+		return ErrInsufficientPermissionsToManageStorage
+	}
+
+	if config.GetEnv().IsCloud && storage.Type == StorageTypeLocal &&
+		user.Role != users_enums.UserRoleAdmin {
+		return ErrLocalStorageNotAllowedInCloudMode
 	}
 
 	isUpdate := storage.ID != uuid.Nil
+
+	if storage.IsSystem && user.Role != users_enums.UserRoleAdmin {
+		// only admin can manage system storage
+		return ErrInsufficientPermissionsToManageStorage
+	}
 
 	if isUpdate {
 		existingStorage, err := s.storageRepository.FindByID(storage.ID)
@@ -41,10 +83,16 @@ func (s *StorageService) SaveStorage(
 		}
 
 		if existingStorage.WorkspaceID != workspaceID {
-			return errors.New("storage does not belong to this workspace")
+			return ErrStorageDoesNotBelongToWorkspace
+		}
+
+		if existingStorage.IsSystem && !storage.IsSystem {
+			return ErrSystemStorageCannotBeMadePrivate
 		}
 
 		existingStorage.Update(storage)
+
+		oldName := existingStorage.Name
 
 		if err := existingStorage.EncryptSensitiveData(s.fieldEncryptor); err != nil {
 			return err
@@ -59,11 +107,19 @@ func (s *StorageService) SaveStorage(
 			return err
 		}
 
-		s.auditLogService.WriteAuditLog(
-			fmt.Sprintf("Storage updated: %s", existingStorage.Name),
-			&user.ID,
-			&workspaceID,
-		)
+		if oldName != existingStorage.Name {
+			s.auditLogService.WriteAuditLog(
+				fmt.Sprintf("Storage renamed from '%s' to '%s'", oldName, existingStorage.Name),
+				&user.ID,
+				&workspaceID,
+			)
+		} else {
+			s.auditLogService.WriteAuditLog(
+				fmt.Sprintf("Storage updated: %s", existingStorage.Name),
+				&user.ID,
+				&workspaceID,
+			)
+		}
 	} else {
 		storage.WorkspaceID = workspaceID
 
@@ -104,7 +160,20 @@ func (s *StorageService) DeleteStorage(
 		return err
 	}
 	if !canManage {
-		return errors.New("insufficient permissions to manage storage in this workspace")
+		return ErrInsufficientPermissionsToManageStorage
+	}
+
+	if storage.IsSystem && user.Role != users_enums.UserRoleAdmin {
+		// only admin can manage system storage
+		return ErrInsufficientPermissionsToManageStorage
+	}
+
+	attachedDatabasesIDs, err := s.storageDatabaseCounter.GetStorageAttachedDatabasesIDs(storage.ID)
+	if err != nil {
+		return err
+	}
+	if len(attachedDatabasesIDs) > 0 {
+		return ErrStorageHasAttachedDatabases
 	}
 
 	err = s.storageRepository.Delete(storage)
@@ -130,15 +199,21 @@ func (s *StorageService) GetStorage(
 		return nil, err
 	}
 
-	canView, _, err := s.workspaceService.CanUserAccessWorkspace(storage.WorkspaceID, user)
-	if err != nil {
-		return nil, err
-	}
-	if !canView {
-		return nil, errors.New("insufficient permissions to view storage in this workspace")
+	if !storage.IsSystem {
+		canView, _, err := s.workspaceService.CanUserAccessWorkspace(storage.WorkspaceID, user)
+		if err != nil {
+			return nil, err
+		}
+		if !canView {
+			return nil, ErrInsufficientPermissionsToViewStorage
+		}
 	}
 
 	storage.HideSensitiveData()
+
+	if storage.IsSystem && user.Role != users_enums.UserRoleAdmin {
+		storage.HideAllData()
+	}
 
 	return storage, nil
 }
@@ -152,7 +227,7 @@ func (s *StorageService) GetStorages(
 		return nil, err
 	}
 	if !canView {
-		return nil, errors.New("insufficient permissions to view storages in this workspace")
+		return nil, ErrInsufficientPermissionsToViewStorages
 	}
 
 	storages, err := s.storageRepository.FindByWorkspaceID(workspaceID)
@@ -162,6 +237,10 @@ func (s *StorageService) GetStorages(
 
 	for _, storage := range storages {
 		storage.HideSensitiveData()
+
+		if storage.IsSystem && user.Role != users_enums.UserRoleAdmin {
+			storage.HideAllData()
+		}
 	}
 
 	return storages, nil
@@ -181,7 +260,7 @@ func (s *StorageService) TestStorageConnection(
 		return err
 	}
 	if !canView {
-		return errors.New("insufficient permissions to test storage in this workspace")
+		return ErrInsufficientPermissionsToTestStorage
 	}
 
 	err = storage.TestConnection(s.fieldEncryptor)
@@ -201,8 +280,14 @@ func (s *StorageService) TestStorageConnection(
 }
 
 func (s *StorageService) TestStorageConnectionDirect(
+	user *users_models.User,
 	storage *Storage,
 ) error {
+	if config.GetEnv().IsCloud && storage.Type == StorageTypeLocal &&
+		user.Role != users_enums.UserRoleAdmin {
+		return ErrLocalStorageNotAllowedInCloudMode
+	}
+
 	var usingStorage *Storage
 
 	if storage.ID != uuid.Nil {
@@ -212,7 +297,7 @@ func (s *StorageService) TestStorageConnectionDirect(
 		}
 
 		if existingStorage.WorkspaceID != storage.WorkspaceID {
-			return errors.New("storage does not belong to this workspace")
+			return ErrStorageDoesNotBelongToWorkspace
 		}
 
 		existingStorage.Update(storage)
@@ -235,17 +320,89 @@ func (s *StorageService) GetStorageByID(
 	return s.storageRepository.FindByID(id)
 }
 
-func (s *StorageService) OnBeforeWorkspaceDeletion(workspaceID uuid.UUID) error {
-	storages, err := s.storageRepository.FindByWorkspaceID(workspaceID)
+func (s *StorageService) GetAllStorages() ([]*Storage, error) {
+	return s.storageRepository.GetAllStorages()
+}
+
+func (s *StorageService) TransferStorageToWorkspace(
+	user *users_models.User,
+	storageID uuid.UUID,
+	targetWorkspaceID uuid.UUID,
+	transferingWithDbID *uuid.UUID,
+) error {
+	existingStorage, err := s.storageRepository.FindByID(storageID)
 	if err != nil {
-		return fmt.Errorf("failed to get storages for workspace deletion: %w", err)
+		return err
 	}
 
-	for _, storage := range storages {
-		if err := s.storageRepository.Delete(storage); err != nil {
-			return fmt.Errorf("failed to delete storage %s: %w", storage.ID, err)
-		}
+	if existingStorage.IsSystem {
+		return ErrSystemStorageCannotBeTransferred
 	}
+
+	canManageSource, err := s.workspaceService.CanUserManageDBs(existingStorage.WorkspaceID, user)
+	if err != nil {
+		return err
+	}
+	if !canManageSource {
+		return ErrInsufficientPermissionsInSourceWorkspace
+	}
+
+	canManageTarget, err := s.workspaceService.CanUserManageDBs(targetWorkspaceID, user)
+	if err != nil {
+		return err
+	}
+	if !canManageTarget {
+		return ErrInsufficientPermissionsInTargetWorkspace
+	}
+
+	attachedDatabasesIDs, err := s.storageDatabaseCounter.GetStorageAttachedDatabasesIDs(
+		existingStorage.ID,
+	)
+	if err != nil {
+		return err
+	}
+
+	if transferingWithDbID != nil {
+		for _, dbID := range attachedDatabasesIDs {
+			if dbID != *transferingWithDbID {
+				return ErrStorageHasOtherAttachedDatabasesCannotTransfer
+			}
+		}
+	} else if len(attachedDatabasesIDs) > 0 {
+		return ErrStorageHasAttachedDatabasesCannotTransfer
+	}
+
+	sourceWorkspaceID := existingStorage.WorkspaceID
+	existingStorage.WorkspaceID = targetWorkspaceID
+
+	_, err = s.storageRepository.Save(existingStorage)
+	if err != nil {
+		return err
+	}
+
+	sourceWorkspace, err := s.workspaceService.GetWorkspaceByID(sourceWorkspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to get source workspace: %w", err)
+	}
+
+	targetWorkspace, err := s.workspaceService.GetWorkspaceByID(targetWorkspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to get target workspace: %w", err)
+	}
+
+	s.auditLogService.WriteAuditLog(
+		fmt.Sprintf("Storage transferred out: %s to workspace '%s'",
+			existingStorage.Name, targetWorkspace.Name),
+		&user.ID,
+		&sourceWorkspaceID,
+	)
+
+	s.auditLogService.WriteAuditLog(
+		fmt.Sprintf("Storage transferred in: %s from workspace '%s'",
+			existingStorage.Name, sourceWorkspace.Name),
+		&user.ID,
+		&targetWorkspaceID,
+	)
 
 	return nil
 }

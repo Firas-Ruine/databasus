@@ -3,8 +3,9 @@ package s3_storage
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
-	"databasus-backend/internal/util/encryption"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+
+	"databasus-backend/internal/util/encryption"
 )
 
 const (
@@ -24,6 +27,7 @@ const (
 	s3ResponseTimeout     = 30 * time.Second
 	s3IdleConnTimeout     = 90 * time.Second
 	s3TLSHandshakeTimeout = 30 * time.Second
+	s3DeleteTimeout       = 30 * time.Second
 
 	// Chunk size for multipart uploads - 16MB provides good balance between
 	// memory usage and upload efficiency. This creates backpressure to pg_dump
@@ -39,9 +43,10 @@ type S3Storage struct {
 	S3SecretKey string    `json:"s3SecretKey" gorm:"not null;type:text;column:s3_secret_key"`
 	S3Endpoint  string    `json:"s3Endpoint"  gorm:"type:text;column:s3_endpoint"`
 
-	S3Prefix                string `json:"s3Prefix"                gorm:"type:text;column:s3_prefix"`
-	S3UseVirtualHostedStyle bool   `json:"s3UseVirtualHostedStyle" gorm:"default:false;column:s3_use_virtual_hosted_style"`
-	SkipTLSVerify           bool   `json:"skipTLSVerify"           gorm:"default:false;column:skip_tls_verify"`
+	S3Prefix                string         `json:"s3Prefix"                gorm:"type:text;column:s3_prefix"`
+	S3UseVirtualHostedStyle bool           `json:"s3UseVirtualHostedStyle" gorm:"default:false;column:s3_use_virtual_hosted_style"`
+	SkipTLSVerify           bool           `json:"skipTLSVerify"           gorm:"default:false;column:skip_tls_verify"`
+	S3StorageClass          S3StorageClass `json:"s3StorageClass"          gorm:"type:text;column:s3_storage_class;default:''"`
 }
 
 func (s *S3Storage) TableName() string {
@@ -52,7 +57,7 @@ func (s *S3Storage) SaveFile(
 	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
 	logger *slog.Logger,
-	fileID uuid.UUID,
+	fileName string,
 	file io.Reader,
 ) error {
 	select {
@@ -66,13 +71,13 @@ func (s *S3Storage) SaveFile(
 		return err
 	}
 
-	objectKey := s.buildObjectKey(fileID.String())
+	objectKey := s.buildObjectKey(fileName)
 
 	uploadID, err := coreClient.NewMultipartUpload(
 		ctx,
 		s.S3Bucket,
 		objectKey,
-		minio.PutObjectOptions{},
+		s.putObjectOptions(),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initiate multipart upload: %w", err)
@@ -101,15 +106,21 @@ func (s *S3Storage) SaveFile(
 			return fmt.Errorf("read error: %w", readErr)
 		}
 
+		partData := buf[:n]
+		hash := md5.Sum(partData)
+		md5Base64 := base64.StdEncoding.EncodeToString(hash[:])
+
 		part, err := coreClient.PutObjectPart(
 			ctx,
 			s.S3Bucket,
 			objectKey,
 			uploadID,
 			partNumber,
-			bytes.NewReader(buf[:n]),
+			bytes.NewReader(partData),
 			int64(n),
-			minio.PutObjectPartOptions{},
+			minio.PutObjectPartOptions{
+				Md5Base64: md5Base64,
+			},
 		)
 		if err != nil {
 			_ = coreClient.AbortMultipartUpload(ctx, s.S3Bucket, objectKey, uploadID)
@@ -141,13 +152,16 @@ func (s *S3Storage) SaveFile(
 		if err != nil {
 			return err
 		}
+		opts := s.putObjectOptions()
+		opts.SendContentMd5 = true
+
 		_, err = client.PutObject(
 			ctx,
 			s.S3Bucket,
 			objectKey,
 			bytes.NewReader([]byte{}),
 			0,
-			minio.PutObjectOptions{},
+			opts,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to upload empty file: %w", err)
@@ -161,7 +175,7 @@ func (s *S3Storage) SaveFile(
 		objectKey,
 		uploadID,
 		parts,
-		minio.PutObjectOptions{},
+		s.putObjectOptions(),
 	)
 	if err != nil {
 		_ = coreClient.AbortMultipartUpload(ctx, s.S3Bucket, objectKey, uploadID)
@@ -173,14 +187,14 @@ func (s *S3Storage) SaveFile(
 
 func (s *S3Storage) GetFile(
 	encryptor encryption.FieldEncryptor,
-	fileID uuid.UUID,
+	fileName string,
 ) (io.ReadCloser, error) {
 	client, err := s.getClient(encryptor)
 	if err != nil {
 		return nil, err
 	}
 
-	objectKey := s.buildObjectKey(fileID.String())
+	objectKey := s.buildObjectKey(fileName)
 
 	object, err := client.GetObject(
 		context.TODO(),
@@ -195,7 +209,7 @@ func (s *S3Storage) GetFile(
 	// Check if the file actually exists by reading the first byte
 	buf := make([]byte, 1)
 	_, readErr := object.Read(buf)
-	if readErr != nil && readErr != io.EOF {
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
 		_ = object.Close()
 		return nil, fmt.Errorf("file does not exist in S3: %w", readErr)
 	}
@@ -210,17 +224,19 @@ func (s *S3Storage) GetFile(
 	return object, nil
 }
 
-func (s *S3Storage) DeleteFile(encryptor encryption.FieldEncryptor, fileID uuid.UUID) error {
+func (s *S3Storage) DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error {
 	client, err := s.getClient(encryptor)
 	if err != nil {
 		return err
 	}
 
-	objectKey := s.buildObjectKey(fileID.String())
+	objectKey := s.buildObjectKey(fileName)
 
-	// Delete the object using MinIO client
+	ctx, cancel := context.WithTimeout(context.Background(), s3DeleteTimeout)
+	defer cancel()
+
 	err = client.RemoveObject(
-		context.TODO(),
+		ctx,
 		s.S3Bucket,
 		objectKey,
 		minio.RemoveObjectOptions{},
@@ -283,7 +299,9 @@ func (s *S3Storage) TestConnection(encryptor encryption.FieldEncryptor) error {
 		testObjectKey,
 		testReader,
 		int64(len(testData)),
-		minio.PutObjectOptions{},
+		minio.PutObjectOptions{
+			SendContentMd5: true,
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("failed to upload test file to S3: %w", err)
@@ -334,6 +352,7 @@ func (s *S3Storage) Update(incoming *S3Storage) {
 	s.S3Endpoint = incoming.S3Endpoint
 	s.S3UseVirtualHostedStyle = incoming.S3UseVirtualHostedStyle
 	s.SkipTLSVerify = incoming.SkipTLSVerify
+	s.S3StorageClass = incoming.S3StorageClass
 
 	if incoming.S3AccessKey != "" {
 		s.S3AccessKey = incoming.S3AccessKey
@@ -344,7 +363,13 @@ func (s *S3Storage) Update(incoming *S3Storage) {
 	}
 
 	// we do not allow to change the prefix after creation,
-	// otherwise we will have to migrate all the data to the new prefix
+	// otherwise we will have to transfer all the data to the new prefix
+}
+
+func (s *S3Storage) putObjectOptions() minio.PutObjectOptions {
+	return minio.PutObjectOptions{
+		StorageClass: string(s.S3StorageClass),
+	}
 }
 
 func (s *S3Storage) buildObjectKey(fileName string) string {
@@ -356,7 +381,7 @@ func (s *S3Storage) buildObjectKey(fileName string) string {
 	prefix = strings.TrimPrefix(prefix, "/")
 
 	if !strings.HasSuffix(prefix, "/") {
-		prefix = prefix + "/"
+		prefix += "/"
 	}
 
 	return prefix + fileName
@@ -408,15 +433,15 @@ func (s *S3Storage) getCoreClient(encryptor encryption.FieldEncryptor) (*minio.C
 
 func (s *S3Storage) getClientParams(
 	encryptor encryption.FieldEncryptor,
-) (endpoint string, useSSL bool, accessKey string, secretKey string, bucketLookup minio.BucketLookupType, transport *http.Transport, err error) {
+) (endpoint string, useSSL bool, accessKey, secretKey string, bucketLookup minio.BucketLookupType, transport *http.Transport, err error) {
 	endpoint = s.S3Endpoint
 	useSSL = true
 
-	if strings.HasPrefix(endpoint, "http://") {
+	if after, ok := strings.CutPrefix(endpoint, "http://"); ok {
 		useSSL = false
-		endpoint = strings.TrimPrefix(endpoint, "http://")
-	} else if strings.HasPrefix(endpoint, "https://") {
-		endpoint = strings.TrimPrefix(endpoint, "https://")
+		endpoint = after
+	} else if after, ok := strings.CutPrefix(endpoint, "https://"); ok {
+		endpoint = after
 	}
 
 	if endpoint == "" {

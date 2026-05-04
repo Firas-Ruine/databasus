@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from 'react';
 import { IS_CLOUD, getApplicationServer } from '../../../constants';
 import { settingsApi } from '../../../entity/users/api/settingsApi';
 import type { UsersSettings } from '../../../entity/users/model/UsersSettings';
+import { ClipboardHelper } from '../../../shared/lib/ClipboardHelper';
 import { AuditLogsComponent } from './AuditLogsComponent';
 
 interface Props {
@@ -91,7 +92,7 @@ export function SettingsComponent({ contentHeight }: Props) {
   console.log(`isCloud = ${IS_CLOUD}`);
 
   return (
-    <div className="flex grow sm:pl-5">
+    <div className="flex grow">
       <div className="w-full">
         <div
           ref={scrollContainerRef}
@@ -218,7 +219,7 @@ export function SettingsComponent({ contentHeight }: Props) {
           <div className="mt-3 text-sm text-gray-500 dark:text-gray-400">
             Read more about settings you can{' '}
             <a
-              href="https://databasus.com/access-management/#global-settings"
+              href="https://databasus.com/access-management#global-settings"
               target="_blank"
               rel="noreferrer"
               className="!text-blue-600"
@@ -247,7 +248,9 @@ export function SettingsComponent({ contentHeight }: Props) {
                   size="small"
                   className="ml-2 opacity-0 transition-opacity group-hover:opacity-100"
                   onClick={() => {
-                    navigator.clipboard.writeText(`${getApplicationServer()}/api/v1/system/health`);
+                    ClipboardHelper.copyToClipboard(
+                      `${getApplicationServer()}/api/v1/system/health`,
+                    );
                     message.success('Health-check endpoint copied to clipboard');
                   }}
                 >

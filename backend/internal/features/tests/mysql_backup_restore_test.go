@@ -17,13 +17,11 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"databasus-backend/internal/config"
-	"databasus-backend/internal/features/backups/backups"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	mysqltypes "databasus-backend/internal/features/databases/databases/mysql"
-	"databasus-backend/internal/features/restores"
-	restores_enums "databasus-backend/internal/features/restores/enums"
-	restores_models "databasus-backend/internal/features/restores/models"
+	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
@@ -164,7 +162,7 @@ func testMysqlBackupRestoreForVersion(t *testing.T, mysqlVersion tools.MysqlVers
 	createBackupViaAPI(t, router, database.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 
 	newDBName := "restoreddb_mysql"
 	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
@@ -188,7 +186,7 @@ func testMysqlBackupRestoreForVersion(t *testing.T, mysqlVersion tools.MysqlVers
 	)
 
 	restore := waitForMysqlRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	var tableExists int
 	err = newDB.Get(
@@ -261,7 +259,7 @@ func testMysqlBackupRestoreWithEncryptionForVersion(
 	createBackupViaAPI(t, router, database.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 	assert.Equal(t, backups_config.BackupEncryptionEncrypted, backup.Encryption)
 
 	newDBName := "restoreddb_mysql_encrypted"
@@ -286,7 +284,7 @@ func testMysqlBackupRestoreWithEncryptionForVersion(
 	)
 
 	restore := waitForMysqlRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	var tableExists int
 	err = newDB.Get(
@@ -369,7 +367,7 @@ func testMysqlBackupRestoreWithReadOnlyUserForVersion(
 	createBackupViaAPI(t, router, updatedDatabase.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, updatedDatabase.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 
 	newDBName := "restoreddb_mysql_readonly"
 	_, err = container.DB.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s;", newDBName))
@@ -393,7 +391,7 @@ func testMysqlBackupRestoreWithReadOnlyUserForVersion(
 	)
 
 	restore := waitForMysqlRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	var tableExists int
 	err = newDB.Get(
@@ -481,7 +479,7 @@ func createMysqlRestoreViaAPI(
 	version tools.MysqlVersion,
 	token string,
 ) {
-	request := restores.RestoreBackupRequest{
+	request := restores_core.RestoreBackupRequest{
 		MysqlDatabase: &mysqltypes.MysqlDatabase{
 			Host:     host,
 			Port:     port,
@@ -508,7 +506,7 @@ func waitForMysqlRestoreCompletion(
 	backupID uuid.UUID,
 	token string,
 	timeout time.Duration,
-) *restores_models.Restore {
+) *restores_core.Restore {
 	startTime := time.Now()
 	pollInterval := 500 * time.Millisecond
 
@@ -517,7 +515,7 @@ func waitForMysqlRestoreCompletion(
 			t.Fatalf("Timeout waiting for MySQL restore completion after %v", timeout)
 		}
 
-		var restoresList []*restores_models.Restore
+		var restoresList []*restores_core.Restore
 		test_utils.MakeGetRequestAndUnmarshal(
 			t,
 			router,
@@ -528,10 +526,10 @@ func waitForMysqlRestoreCompletion(
 		)
 
 		for _, restore := range restoresList {
-			if restore.Status == restores_enums.RestoreStatusCompleted {
+			if restore.Status == restores_core.RestoreStatusCompleted {
 				return restore
 			}
-			if restore.Status == restores_enums.RestoreStatusFailed {
+			if restore.Status == restores_core.RestoreStatusFailed {
 				failMsg := "unknown error"
 				if restore.FailMessage != nil {
 					failMsg = *restore.FailMessage
@@ -544,7 +542,7 @@ func waitForMysqlRestoreCompletion(
 	}
 }
 
-func verifyMysqlDataIntegrity(t *testing.T, originalDB *sqlx.DB, restoredDB *sqlx.DB) {
+func verifyMysqlDataIntegrity(t *testing.T, originalDB, restoredDB *sqlx.DB) {
 	var originalData []MysqlTestDataItem
 	var restoredData []MysqlTestDataItem
 
@@ -579,7 +577,7 @@ func connectToMysqlContainer(version tools.MysqlVersion, port string) (*MysqlCon
 	dbName := "testdb"
 	password := "rootpassword"
 	username := "root"
-	host := "127.0.0.1"
+	host := config.GetEnv().TestLocalhost
 
 	portInt, err := strconv.Atoi(port)
 	if err != nil {

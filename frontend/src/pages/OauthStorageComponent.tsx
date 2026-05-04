@@ -1,13 +1,15 @@
 import { Modal, Spin } from 'antd';
 import { useEffect, useState } from 'react';
 
-import { GOOGLE_DRIVE_OAUTH_REDIRECT_URL } from '../constants';
 import { type Storage, StorageType } from '../entity/storages';
 import type { StorageOauthDto } from '../entity/storages/models/StorageOauthDto';
+import type { UserProfile } from '../entity/users';
+import { userApi } from '../entity/users';
 import { EditStorageComponent } from '../features/storages/ui/edit/EditStorageComponent';
 
 export function OauthStorageComponent() {
   const [storage, setStorage] = useState<Storage | undefined>();
+  const [user, setUser] = useState<UserProfile | undefined>();
 
   const exchangeGoogleOauthCode = async (oauthDto: StorageOauthDto) => {
     if (!oauthDto.storage.googleDriveStorage) {
@@ -17,6 +19,8 @@ export function OauthStorageComponent() {
 
     const { clientId, clientSecret } = oauthDto.storage.googleDriveStorage;
     const { authCode } = oauthDto;
+
+    const redirectUri = `${window.location.origin}/storages/google-oauth`;
 
     try {
       // Exchange authorization code for access token
@@ -29,13 +33,16 @@ export function OauthStorageComponent() {
           code: authCode,
           client_id: clientId,
           client_secret: clientSecret,
-          redirect_uri: GOOGLE_DRIVE_OAUTH_REDIRECT_URL,
+          redirect_uri: redirectUri,
           grant_type: 'authorization_code',
         }),
       });
 
       if (!response.ok) {
-        throw new Error(`OAuth exchange failed: ${response.statusText}`);
+        const errorData = await response.json();
+        throw new Error(
+          errorData.error_description || `OAuth exchange failed: ${response.statusText}`,
+        );
       }
 
       const tokenData = await response.json();
@@ -44,30 +51,61 @@ export function OauthStorageComponent() {
       setStorage(oauthDto.storage);
     } catch (error) {
       alert(`Failed to exchange OAuth code: ${error}`);
+      // Return to home if exchange fails
+      setTimeout(() => {
+        window.location.href = '/';
+      }, 3000);
     }
   };
 
-  useEffect(() => {
-    const oauthDtoParam = new URLSearchParams(window.location.search).get('oauthDto');
-    if (!oauthDtoParam) {
-      alert('OAuth param not found');
-      return;
-    }
-
-    const decodedParam = decodeURIComponent(oauthDtoParam);
-    const oauthDto: StorageOauthDto = JSON.parse(decodedParam);
-
+  /**
+   * Helper to validate the DTO and start the exchange process
+   */
+  const processOauthDto = (oauthDto: StorageOauthDto) => {
     if (oauthDto.storage.type === StorageType.GOOGLE_DRIVE) {
       if (!oauthDto.storage.googleDriveStorage) {
-        alert('Google Drive storage not found');
+        alert('Google Drive storage configuration not found in DTO');
         return;
       }
 
       exchangeGoogleOauthCode(oauthDto);
+    } else {
+      alert('Unsupported storage type for OAuth');
     }
+  };
+
+  useEffect(() => {
+    userApi
+      .getCurrentUser()
+      .then(setUser)
+      .catch(() => {
+        window.location.href = '/';
+      });
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const code = urlParams.get('code');
+    const state = urlParams.get('state');
+
+    if (code && state) {
+      try {
+        const decodedState = decodeURIComponent(state);
+        const oauthDto: StorageOauthDto = JSON.parse(decodedState);
+
+        oauthDto.authCode = code;
+
+        processOauthDto(oauthDto);
+        return;
+      } catch (e) {
+        console.error('Error parsing OAuth state:', e);
+        alert('OAuth state parameter is invalid');
+        return;
+      }
+    }
+
+    alert('OAuth param not found. Ensure the redirect URL is configured correctly.');
   }, []);
 
-  if (!storage) {
+  if (!storage || !user) {
     return (
       <div className="mt-20 flex justify-center">
         <Spin />
@@ -91,6 +129,7 @@ export function OauthStorageComponent() {
 
         <EditStorageComponent
           workspaceId={storage.workspaceId}
+          user={user}
           isShowClose={false}
           onClose={() => {}}
           isShowName={false}

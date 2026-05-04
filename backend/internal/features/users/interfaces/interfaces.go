@@ -5,5 +5,9 @@ import (
 )
 
 type AuditLogWriter interface {
-	WriteAuditLog(message string, userID *uuid.UUID, workspaceID *uuid.UUID)
+	WriteAuditLog(message string, userID, workspaceID *uuid.UUID)
+}
+
+type EmailSender interface {
+	SendEmail(to, subject, body string) error
 }

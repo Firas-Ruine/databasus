@@ -12,13 +12,11 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"databasus-backend/internal/features/databases"
-	"databasus-backend/internal/features/databases/databases/postgresql"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_controllers "databasus-backend/internal/features/workspaces/controllers"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
 	test_utils "databasus-backend/internal/util/testing"
-	"databasus-backend/internal/util/tools"
 )
 
 func createTestRouter() *gin.Engine {
@@ -111,7 +109,13 @@ func Test_GetAttemptsByDatabase_PermissionsEnforced(t *testing.T) {
 				testUserToken = owner.Token
 			} else if tt.workspaceRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			} else {
 				nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
@@ -140,6 +144,10 @@ func Test_GetAttemptsByDatabase_PermissionsEnforced(t *testing.T) {
 				)
 				assert.Contains(t, string(testResp.Body), "forbidden")
 			}
+
+			// Cleanup
+			databases.RemoveTestDatabase(database)
+			workspaces_testing.RemoveTestWorkspace(workspace, router)
 		})
 	}
 }
@@ -177,6 +185,10 @@ func Test_GetAttemptsByDatabase_FiltersByAfterDate(t *testing.T) {
 	for _, attempt := range response {
 		assert.True(t, attempt.CreatedAt.After(afterDate) || attempt.CreatedAt.Equal(afterDate))
 	}
+
+	// Cleanup
+	databases.RemoveTestDatabase(database)
+	workspaces_testing.RemoveTestWorkspace(workspace, router)
 }
 
 func Test_GetAttemptsByDatabase_ReturnsEmptyListForNewDatabase(t *testing.T) {
@@ -197,6 +209,10 @@ func Test_GetAttemptsByDatabase_ReturnsEmptyListForNewDatabase(t *testing.T) {
 	)
 
 	assert.Equal(t, 0, len(response))
+
+	// Cleanup
+	databases.RemoveTestDatabase(database)
+	workspaces_testing.RemoveTestWorkspace(workspace, router)
 }
 
 func createTestDatabaseViaAPI(
@@ -205,20 +221,11 @@ func createTestDatabaseViaAPI(
 	token string,
 	router *gin.Engine,
 ) *databases.Database {
-	testDbName := "test_db"
 	request := databases.Database{
 		WorkspaceID: &workspaceID,
 		Name:        name,
 		Type:        databases.DatabaseTypePostgres,
-		Postgresql: &postgresql.PostgresqlDatabase{
-			Version:  tools.PostgresqlVersion16,
-			Host:     "localhost",
-			Port:     5432,
-			Username: "postgres",
-			Password: "postgres",
-			Database: &testDbName,
-			CpuCount: 1,
-		},
+		Postgresql:  databases.GetTestPostgresConfig(),
 	}
 
 	w := workspaces_testing.MakeAPIRequest(

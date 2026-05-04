@@ -1,6 +1,7 @@
 package users_services
 
 import (
+	"databasus-backend/internal/features/email"
 	"databasus-backend/internal/features/encryption/secrets"
 	users_repositories "databasus-backend/internal/features/users/repositories"
 )
@@ -10,11 +11,15 @@ var userService = &UserService{
 	secrets.GetSecretKeyService(),
 	settingsService,
 	nil,
+	email.GetEmailSMTPSender(),
+	users_repositories.GetPasswordResetRepository(),
 }
+
 var settingsService = &SettingsService{
 	users_repositories.GetUsersSettingsRepository(),
 	nil,
 }
+
 var managementService = &UserManagementService{
 	users_repositories.GetUserRepository(),
 	nil,

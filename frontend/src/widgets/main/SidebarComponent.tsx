@@ -1,13 +1,14 @@
 import { CloseOutlined } from '@ant-design/icons';
 import { Drawer, Tooltip } from 'antd';
 import { useEffect } from 'react';
-import GitHubButton from 'react-github-btn';
 
+import { IS_CLOUD } from '../../constants';
 import { type DiskUsage } from '../../entity/disk';
 import { type UserProfile, UserRole } from '../../entity/users';
 import { useIsMobile } from '../../shared/hooks';
 import { useTheme } from '../../shared/theme';
-import { ThemeToggleComponent } from './ThemeToggleComponent';
+import { StarButtonComponent } from '../../shared/ui/StarButtonComponent';
+import { ThemeToggleComponent } from '../../shared/ui/ThemeToggleComponent';
 
 interface TabItem {
   text: string;
@@ -196,15 +197,6 @@ export const SidebarComponent = ({
 
             <a
               className="block rounded text-sm font-medium !text-gray-700 hover:bg-gray-100 hover:!text-blue-600 dark:!text-gray-300 dark:hover:bg-gray-700"
-              href="https://databasus.com/contribute"
-              target="_blank"
-              rel="noreferrer"
-            >
-              Contribute
-            </a>
-
-            <a
-              className="block rounded text-sm font-medium !text-gray-700 hover:bg-gray-100 hover:!text-blue-600 dark:!text-gray-300 dark:hover:bg-gray-700"
               href="https://t.me/databasus_community"
               target="_blank"
               rel="noreferrer"
@@ -212,16 +204,19 @@ export const SidebarComponent = ({
               Community
             </a>
 
-            <div className="pt-2">
-              <GitHubButton
-                href="https://github.com/databasus/databasus"
-                data-icon="octicon-star"
-                data-size="large"
-                data-show-count="true"
-                aria-label="Star databasus/databasus on GitHub"
+            {!IS_CLOUD && (
+              <a
+                className="block rounded text-sm font-medium !text-gray-700 hover:bg-gray-100 hover:!text-blue-600 dark:!text-gray-300 dark:hover:bg-gray-700"
+                href="https://databasus.com/cloud"
+                target="_blank"
+                rel="noreferrer"
               >
-                Star on GitHub
-              </GitHubButton>
+                Cloud
+              </a>
+            )}
+
+            <div className="flex pt-2">
+              <StarButtonComponent />
             </div>
           </div>
         </div>

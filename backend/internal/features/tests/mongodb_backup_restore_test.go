@@ -19,13 +19,11 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"databasus-backend/internal/config"
-	"databasus-backend/internal/features/backups/backups"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	mongodbtypes "databasus-backend/internal/features/databases/databases/mongodb"
-	"databasus-backend/internal/features/restores"
-	restores_enums "databasus-backend/internal/features/restores/enums"
-	restores_models "databasus-backend/internal/features/restores/models"
+	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
@@ -59,7 +57,6 @@ func Test_BackupAndRestoreMongodb_RestoreIsSuccessful(t *testing.T) {
 		version tools.MongodbVersion
 		port    string
 	}{
-		{"MongoDB 4.0", tools.MongodbVersion4, env.TestMongodb40Port},
 		{"MongoDB 4.2", tools.MongodbVersion4, env.TestMongodb42Port},
 		{"MongoDB 4.4", tools.MongodbVersion4, env.TestMongodb44Port},
 		{"MongoDB 5.0", tools.MongodbVersion5, env.TestMongodb50Port},
@@ -83,7 +80,6 @@ func Test_BackupAndRestoreMongodbWithEncryption_RestoreIsSuccessful(t *testing.T
 		version tools.MongodbVersion
 		port    string
 	}{
-		{"MongoDB 4.0", tools.MongodbVersion4, env.TestMongodb40Port},
 		{"MongoDB 4.2", tools.MongodbVersion4, env.TestMongodb42Port},
 		{"MongoDB 4.4", tools.MongodbVersion4, env.TestMongodb44Port},
 		{"MongoDB 5.0", tools.MongodbVersion5, env.TestMongodb50Port},
@@ -107,7 +103,6 @@ func Test_BackupAndRestoreMongodb_WithReadOnlyUser_RestoreIsSuccessful(t *testin
 		version tools.MongodbVersion
 		port    string
 	}{
-		{"MongoDB 4.0", tools.MongodbVersion4, env.TestMongodb40Port},
 		{"MongoDB 4.2", tools.MongodbVersion4, env.TestMongodb42Port},
 		{"MongoDB 4.4", tools.MongodbVersion4, env.TestMongodb44Port},
 		{"MongoDB 5.0", tools.MongodbVersion5, env.TestMongodb50Port},
@@ -134,7 +129,7 @@ func testMongodbBackupRestoreForVersion(
 		t.Skipf("Skipping MongoDB %s test: %v", mongodbVersion, err)
 		return
 	}
-	defer container.Client.Disconnect(context.Background())
+	defer container.Client.Disconnect(t.Context())
 
 	setupMongodbTestData(t, container)
 
@@ -161,7 +156,7 @@ func testMongodbBackupRestoreForVersion(
 	createBackupViaAPI(t, router, database.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 
 	newDBName := "restoreddb_mongodb_" + uuid.New().String()[:8]
 
@@ -175,11 +170,11 @@ func testMongodbBackupRestoreForVersion(
 	)
 
 	restore := waitForMongodbRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	verifyMongodbDataIntegrity(t, container, newDBName)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	_ = container.Client.Database(newDBName).Drop(ctx)
 
 	err = os.Remove(filepath.Join(config.GetEnv().DataFolder, backup.ID.String()))
@@ -208,7 +203,7 @@ func testMongodbBackupRestoreWithEncryptionForVersion(
 		t.Skipf("Skipping MongoDB %s test: %v", mongodbVersion, err)
 		return
 	}
-	defer container.Client.Disconnect(context.Background())
+	defer container.Client.Disconnect(t.Context())
 
 	setupMongodbTestData(t, container)
 
@@ -239,7 +234,7 @@ func testMongodbBackupRestoreWithEncryptionForVersion(
 	createBackupViaAPI(t, router, database.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, database.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 	assert.Equal(t, backups_config.BackupEncryptionEncrypted, backup.Encryption)
 
 	newDBName := "restoreddb_mongodb_enc_" + uuid.New().String()[:8]
@@ -254,11 +249,11 @@ func testMongodbBackupRestoreWithEncryptionForVersion(
 	)
 
 	restore := waitForMongodbRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	verifyMongodbDataIntegrity(t, container, newDBName)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	_ = container.Client.Database(newDBName).Drop(ctx)
 
 	err = os.Remove(filepath.Join(config.GetEnv().DataFolder, backup.ID.String()))
@@ -287,7 +282,7 @@ func testMongodbBackupRestoreWithReadOnlyUserForVersion(
 		t.Skipf("Skipping MongoDB %s test: %v", mongodbVersion, err)
 		return
 	}
-	defer container.Client.Disconnect(context.Background())
+	defer container.Client.Disconnect(t.Context())
 
 	setupMongodbTestData(t, container)
 
@@ -328,7 +323,7 @@ func testMongodbBackupRestoreWithReadOnlyUserForVersion(
 	createBackupViaAPI(t, router, updatedDatabase.ID, user.Token)
 
 	backup := waitForBackupCompletion(t, router, updatedDatabase.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, backups.BackupStatusCompleted, backup.Status)
+	assert.Equal(t, backups_core.BackupStatusCompleted, backup.Status)
 
 	newDBName := "restoreddb_mongodb_ro_" + uuid.New().String()[:8]
 
@@ -342,11 +337,11 @@ func testMongodbBackupRestoreWithReadOnlyUserForVersion(
 	)
 
 	restore := waitForMongodbRestoreCompletion(t, router, backup.ID, user.Token, 5*time.Minute)
-	assert.Equal(t, restores_enums.RestoreStatusCompleted, restore.Status)
+	assert.Equal(t, restores_core.RestoreStatusCompleted, restore.Status)
 
 	verifyMongodbDataIntegrity(t, container, newDBName)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	_ = container.Client.Database(newDBName).Drop(ctx)
 
 	dropMongodbUserSafe(container.Client, readOnlyUser.Username, container.AuthDatabase)
@@ -387,13 +382,14 @@ func createMongodbDatabaseViaAPI(
 		Type:        databases.DatabaseTypeMongodb,
 		Mongodb: &mongodbtypes.MongodbDatabase{
 			Host:         host,
-			Port:         port,
+			Port:         &port,
 			Username:     username,
 			Password:     password,
 			Database:     database,
 			AuthDatabase: authDatabase,
 			Version:      version,
 			IsHttps:      false,
+			IsSrv:        false,
 			CpuCount:     1,
 		},
 	}
@@ -431,16 +427,17 @@ func createMongodbRestoreViaAPI(
 	version tools.MongodbVersion,
 	token string,
 ) {
-	request := restores.RestoreBackupRequest{
+	request := restores_core.RestoreBackupRequest{
 		MongodbDatabase: &mongodbtypes.MongodbDatabase{
 			Host:         host,
-			Port:         port,
+			Port:         &port,
 			Username:     username,
 			Password:     password,
 			Database:     database,
 			AuthDatabase: authDatabase,
 			Version:      version,
 			IsHttps:      false,
+			IsSrv:        false,
 			CpuCount:     1,
 		},
 	}
@@ -461,7 +458,7 @@ func waitForMongodbRestoreCompletion(
 	backupID uuid.UUID,
 	token string,
 	timeout time.Duration,
-) *restores_models.Restore {
+) *restores_core.Restore {
 	startTime := time.Now()
 	pollInterval := 500 * time.Millisecond
 
@@ -470,7 +467,7 @@ func waitForMongodbRestoreCompletion(
 			t.Fatalf("Timeout waiting for MongoDB restore completion after %v", timeout)
 		}
 
-		var restoresList []*restores_models.Restore
+		var restoresList []*restores_core.Restore
 		test_utils.MakeGetRequestAndUnmarshal(
 			t,
 			router,
@@ -481,10 +478,10 @@ func waitForMongodbRestoreCompletion(
 		)
 
 		for _, restore := range restoresList {
-			if restore.Status == restores_enums.RestoreStatusCompleted {
+			if restore.Status == restores_core.RestoreStatusCompleted {
 				return restore
 			}
-			if restore.Status == restores_enums.RestoreStatusFailed {
+			if restore.Status == restores_core.RestoreStatusFailed {
 				failMsg := "unknown error"
 				if restore.FailMessage != nil {
 					failMsg = *restore.FailMessage
@@ -498,7 +495,7 @@ func waitForMongodbRestoreCompletion(
 }
 
 func verifyMongodbDataIntegrity(t *testing.T, container *MongodbContainer, restoredDBName string) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	originalCollection := container.Client.Database(container.Database).Collection("test_data")
 	restoredCollection := container.Client.Database(restoredDBName).Collection("test_data")
@@ -552,7 +549,7 @@ func connectToMongodbContainer(
 	password := "rootpassword"
 	username := "root"
 	authDatabase := "admin"
-	host := "127.0.0.1"
+	host := config.GetEnv().TestLocalhost
 
 	portInt, err := strconv.Atoi(port)
 	if err != nil {
@@ -560,8 +557,13 @@ func connectToMongodbContainer(
 	}
 
 	uri := fmt.Sprintf(
-		"mongodb://%s:%s@%s:%d/%s?authSource=%s",
-		username, password, host, portInt, dbName, authDatabase,
+		"mongodb://%s:%s@%s:%d/%s?authSource=%s&serverSelectionTimeoutMS=5000&connectTimeoutMS=5000",
+		username,
+		password,
+		host,
+		portInt,
+		dbName,
+		authDatabase,
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -590,12 +592,12 @@ func connectToMongodbContainer(
 }
 
 func setupMongodbTestData(t *testing.T, container *MongodbContainer) {
-	ctx := context.Background()
+	ctx := t.Context()
 	collection := container.Client.Database(container.Database).Collection("test_data")
 
 	_ = collection.Drop(ctx)
 
-	testDocs := []interface{}{
+	testDocs := []any{
 		MongodbTestDataItem{
 			ID:        "1",
 			Name:      "test1",

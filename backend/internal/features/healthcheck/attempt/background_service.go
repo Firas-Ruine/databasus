@@ -1,30 +1,41 @@
 package healthcheck_attempt
 
 import (
-	"databasus-backend/internal/config"
-	healthcheck_config "databasus-backend/internal/features/healthcheck/config"
+	"context"
+	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
+
+	healthcheck_config "databasus-backend/internal/features/healthcheck/config"
 )
 
 type HealthcheckAttemptBackgroundService struct {
 	healthcheckConfigService   *healthcheck_config.HealthcheckConfigService
 	checkDatabaseHealthUseCase *CheckDatabaseHealthUseCase
 	logger                     *slog.Logger
+
+	hasRun atomic.Bool
 }
 
-func (s *HealthcheckAttemptBackgroundService) Run() {
+func (s *HealthcheckAttemptBackgroundService) Run(ctx context.Context) {
+	if s.hasRun.Swap(true) {
+		panic(fmt.Sprintf("%T.Run() called multiple times", s))
+	}
+
 	// first healthcheck immediately
 	s.checkDatabases()
 
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		if config.IsShouldShutdown() {
-			break
-		}
 
-		s.checkDatabases()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.checkDatabases()
+		}
 	}
 }
 

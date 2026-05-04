@@ -2,11 +2,12 @@ package storages
 
 import (
 	"context"
-	"databasus-backend/internal/util/encryption"
 	"io"
 	"log/slog"
 
 	"github.com/google/uuid"
+
+	"databasus-backend/internal/util/encryption"
 )
 
 type StorageFileSaver interface {
@@ -14,13 +15,13 @@ type StorageFileSaver interface {
 		ctx context.Context,
 		encryptor encryption.FieldEncryptor,
 		logger *slog.Logger,
-		fileID uuid.UUID,
+		fileName string,
 		file io.Reader,
 	) error
 
-	GetFile(encryptor encryption.FieldEncryptor, fileID uuid.UUID) (io.ReadCloser, error)
+	GetFile(encryptor encryption.FieldEncryptor, fileName string) (io.ReadCloser, error)
 
-	DeleteFile(encryptor encryption.FieldEncryptor, fileID uuid.UUID) error
+	DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error
 
 	Validate(encryptor encryption.FieldEncryptor) error
 
@@ -29,4 +30,8 @@ type StorageFileSaver interface {
 	HideSensitiveData()
 
 	EncryptSensitiveData(encryptor encryption.FieldEncryptor) error
+}
+
+type StorageDatabaseCounter interface {
+	GetStorageAttachedDatabasesIDs(storageID uuid.UUID) ([]uuid.UUID, error)
 }

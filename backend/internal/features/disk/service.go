@@ -2,20 +2,36 @@ package disk
 
 import (
 	"fmt"
+	"path/filepath"
 	"runtime"
 
 	"github.com/shirou/gopsutil/v4/disk"
+
+	"databasus-backend/internal/config"
 )
 
 type DiskService struct{}
 
 func (s *DiskService) GetDiskUsage() (*DiskUsage, error) {
+	if config.GetEnv().IsCloud {
+		return &DiskUsage{
+			Platform:        PlatformLinux,
+			TotalSpaceBytes: 100,
+			UsedSpaceBytes:  0,
+			FreeSpaceBytes:  100,
+		}, nil
+	}
+
 	platform := s.detectPlatform()
 
-	// Set path based on platform
-	path := "/"
+	var path string
+
 	if platform == PlatformWindows {
 		path = "C:\\"
+	} else {
+		// Use databasus-data folder location for Linux (Docker)
+		cfg := config.GetEnv()
+		path = filepath.Dir(cfg.DataFolder) // Gets /databasus-data from /databasus-data/backups
 	}
 
 	diskUsage, err := disk.Usage(path)

@@ -1,11 +1,12 @@
 package backups_config
 
 import (
-	"databasus-backend/internal/storage"
 	"errors"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"databasus-backend/internal/storage"
 )
 
 type BackupConfigRepository struct{}
@@ -47,7 +48,6 @@ func (r *BackupConfigRepository) Save(
 
 		return nil
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +62,14 @@ func (r *BackupConfigRepository) FindByDatabaseID(databaseID uuid.UUID) (*Backup
 		GetDb().
 		Preload("BackupInterval").
 		Preload("Storage").
+		Preload("Storage.LocalStorage").
+		Preload("Storage.S3Storage").
+		Preload("Storage.GoogleDriveStorage").
+		Preload("Storage.NASStorage").
+		Preload("Storage.AzureBlobStorage").
+		Preload("Storage.FTPStorage").
+		Preload("Storage.SFTPStorage").
+		Preload("Storage.RcloneStorage").
 		Where("database_id = ?", databaseID).
 		First(&backupConfig).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -81,6 +89,14 @@ func (r *BackupConfigRepository) GetWithEnabledBackups() ([]*BackupConfig, error
 		GetDb().
 		Preload("BackupInterval").
 		Preload("Storage").
+		Preload("Storage.LocalStorage").
+		Preload("Storage.S3Storage").
+		Preload("Storage.GoogleDriveStorage").
+		Preload("Storage.NASStorage").
+		Preload("Storage.AzureBlobStorage").
+		Preload("Storage.FTPStorage").
+		Preload("Storage.SFTPStorage").
+		Preload("Storage.RcloneStorage").
 		Where("is_backups_enabled = ?", true).
 		Find(&backupConfigs).Error; err != nil {
 		return nil, err
@@ -101,4 +117,20 @@ func (r *BackupConfigRepository) IsStorageUsing(storageID uuid.UUID) (bool, erro
 	}
 
 	return count > 0, nil
+}
+
+func (r *BackupConfigRepository) GetDatabasesIDsByStorageID(
+	storageID uuid.UUID,
+) ([]uuid.UUID, error) {
+	var databasesIDs []uuid.UUID
+
+	if err := storage.
+		GetDb().
+		Table("backup_configs").
+		Where("storage_id = ?", storageID).
+		Pluck("database_id", &databasesIDs).Error; err != nil {
+		return nil, err
+	}
+
+	return databasesIDs, nil
 }

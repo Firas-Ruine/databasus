@@ -6,14 +6,14 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_testing "databasus-backend/internal/features/users/testing"
 	workspaces_dto "databasus-backend/internal/features/workspaces/dto"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
 	test_utils "databasus-backend/internal/util/testing"
-
-	"github.com/google/uuid"
-	"github.com/stretchr/testify/assert"
 )
 
 // ListMembers Tests
@@ -82,6 +82,8 @@ func Test_GetWorkspaceMembers_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -123,7 +125,11 @@ func Test_GetWorkspaceMembers_PermissionsEnforced(t *testing.T) {
 					"Bearer "+testUserToken,
 					tt.expectedStatusCode,
 				)
-				assert.Contains(t, string(resp.Body), "insufficient permissions to view workspace members")
+				assert.Contains(
+					t,
+					string(resp.Body),
+					"insufficient permissions to view workspace members",
+				)
 			}
 		})
 	}
@@ -206,6 +212,8 @@ func Test_AddMemberToWorkspace_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -266,6 +274,8 @@ func Test_AddMemberToWorkspace_WhenUserIsAlreadyMember_ReturnsBadRequest(t *test
 	member := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
 	workspaces_testing.AddMemberToWorkspaceViaOwner(
 		workspace,
 		member,
@@ -298,6 +308,7 @@ func Test_AddMemberToWorkspace_WithNonExistentUser_ReturnsInvited(t *testing.T) 
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	request := workspaces_dto.AddMemberRequestDTO{
 		Email: uuid.New().String() + "@example.com", // Non-existent user
@@ -328,6 +339,8 @@ func Test_AddMemberToWorkspace_WhenWorkspaceAdminTriesToAddAdmin_ReturnsBadReque
 	newMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
 	workspaces_testing.AddMemberToWorkspaceViaOwner(
 		workspace,
 		workspaceAdmin,
@@ -364,6 +377,8 @@ func Test_AddMemberToWorkspace_WhenWorkspaceAdminTriesToAddWorkspaceAdmin_Return
 	newMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
 	workspaces_testing.AddMemberToWorkspaceViaOwner(
 		workspace,
 		workspaceAdmin,
@@ -446,6 +461,8 @@ func Test_AddWorkspaceAdmin_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -557,6 +574,7 @@ func Test_InviteMemberToWorkspace_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -668,6 +686,7 @@ func Test_ChangeMemberRole_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			workspaces_testing.AddMemberToWorkspaceViaOwner(
 				workspace,
@@ -770,6 +789,7 @@ func Test_ChangeMemberRoleToAdmin_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			workspaces_testing.AddMemberToWorkspaceViaOwner(
 				workspace,
@@ -828,6 +848,7 @@ func Test_ChangeMemberRole_WhenChangingOwnRole_ReturnsBadRequest(t *testing.T) {
 	)
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	request := workspaces_dto.ChangeMemberRoleRequestDTO{
 		Role: users_enums.WorkspaceRoleMember,
@@ -857,6 +878,7 @@ func Test_ChangeMemberRole_WhenChangingOwnerRole_ReturnsBadRequest(t *testing.T)
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	request := workspaces_dto.ChangeMemberRoleRequestDTO{
 		Role: users_enums.WorkspaceRoleMember,
@@ -937,6 +959,7 @@ func Test_RemoveMemberFromWorkspace_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			workspaces_testing.AddMemberToWorkspaceViaOwner(
 				workspace,
@@ -991,6 +1014,7 @@ func Test_RemoveMemberFromWorkspace_WhenRemovingOwner_ReturnsBadRequest(t *testi
 	owner := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	resp := test_utils.MakeRequest(t, router, test_utils.RequestOptions{
 		Method: "DELETE",
@@ -1057,6 +1081,7 @@ func Test_RemoveWorkspaceAdmin_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			workspaces_testing.AddMemberToWorkspaceViaOwner(
 				workspace,
@@ -1161,6 +1186,7 @@ func Test_TransferWorkspaceOwnership_PermissionsEnforced(t *testing.T) {
 				owner,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			workspaces_testing.AddMemberToWorkspaceViaOwner(
 				workspace,
@@ -1202,7 +1228,11 @@ func Test_TransferWorkspaceOwnership_PermissionsEnforced(t *testing.T) {
 			if tt.expectSuccess {
 				assert.Contains(t, string(resp.Body), "Ownership transferred successfully")
 			} else {
-				assert.Contains(t, string(resp.Body), "only workspace owner or admin can transfer ownership")
+				assert.Contains(
+					t,
+					string(resp.Body),
+					"only workspace owner or admin can transfer ownership",
+				)
 			}
 		})
 	}
@@ -1217,6 +1247,7 @@ func Test_TransferWorkspaceOwnership_WhenNewOwnerIsNotMember_ReturnsBadRequest(t
 	nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	request := workspaces_dto.TransferOwnershipRequestDTO{
 		NewOwnerEmail: nonMember.Email,
@@ -1242,6 +1273,8 @@ func Test_TransferWorkspaceOwnership_ThereIsOnlyOneOwner_OldOwnerBecomeAdmin(t *
 	member := users_testing.CreateTestUser(users_enums.UserRoleMember)
 
 	workspace, _ := workspaces_testing.CreateTestWorkspaceViaAPI("Test Workspace", owner, router)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+
 	workspaces_testing.AddMemberToWorkspaceViaOwner(
 		workspace,
 		member,

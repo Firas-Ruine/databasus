@@ -1,12 +1,21 @@
 import { EyeInvisibleOutlined, EyeTwoTone } from '@ant-design/icons';
-import { App, Button, Input } from 'antd';
+import { App, Button, Checkbox, Input } from 'antd';
 import { type JSX, useState } from 'react';
 
-import { IS_CLOUD } from '../../../constants';
+import { useCloudflareTurnstile } from '../../../shared/hooks/useCloudflareTurnstile';
+
+import {
+  CLOUDFLARE_TURNSTILE_SITE_KEY,
+  GITHUB_CLIENT_ID,
+  GOOGLE_CLIENT_ID,
+  IS_CLOUD,
+} from '../../../constants';
 import { userApi } from '../../../entity/users';
 import { StringUtils } from '../../../shared/lib';
 import { FormValidator } from '../../../shared/lib/FormValidator';
-import { OauthComponent } from './OauthComponent';
+import { CloudflareTurnstileWidget } from '../../../shared/ui/CloudflareTurnstileWidget';
+import { GithubOAuthComponent } from './oauth/GithubOAuthComponent';
+import { GoogleOAuthComponent } from './oauth/GoogleOAuthComponent';
 
 interface SignUpComponentProps {
   onSwitchToSignIn?: () => void;
@@ -29,6 +38,11 @@ export function SignUpComponent({ onSwitchToSignIn }: SignUpComponentProps): JSX
   const [confirmPasswordError, setConfirmPasswordError] = useState(false);
 
   const [signUpError, setSignUpError] = useState('');
+
+  const [isTermsAccepted, setTermsAccepted] = useState(false);
+  const [isPolicyAccepted, setPolicyAccepted] = useState(false);
+
+  const { token, containerRef, resetCloudflareTurnstile } = useCloudflareTurnstile();
 
   const validateFieldsForSignUp = (): boolean => {
     if (!name || name.trim() === '') {
@@ -84,10 +98,11 @@ export function SignUpComponent({ onSwitchToSignIn }: SignUpComponentProps): JSX
           email,
           password,
           name,
+          cloudflareTurnstileToken: token,
         });
-        await userApi.signIn({ email, password });
       } catch (e) {
         setSignUpError(StringUtils.capitalizeFirstLetter((e as Error).message));
+        resetCloudflareTurnstile();
       }
     }
 
@@ -98,15 +113,22 @@ export function SignUpComponent({ onSwitchToSignIn }: SignUpComponentProps): JSX
     <div className="w-full max-w-[300px]">
       <div className="mb-5 text-center text-2xl font-bold">Sign up</div>
 
-      <OauthComponent />
+      <div className="mt-4">
+        <div className="space-y-2">
+          <GithubOAuthComponent />
+          <GoogleOAuthComponent />
+        </div>
+      </div>
 
-      {IS_CLOUD && (
+      {(GOOGLE_CLIENT_ID || GITHUB_CLIENT_ID) && (
         <div className="relative my-6">
           <div className="absolute inset-0 flex items-center">
             <div className="w-full border-t border-gray-300"></div>
           </div>
           <div className="relative flex justify-center text-sm">
-            <span className="bg-white px-2 text-gray-500 dark:text-gray-400">or continue</span>
+            <span className="bg-white px-2 text-gray-500 dark:bg-gray-900 dark:text-gray-400">
+              or continue
+            </span>
           </div>
         </div>
       )}
@@ -165,8 +187,53 @@ export function SignUpComponent({ onSwitchToSignIn }: SignUpComponentProps): JSX
 
       <div className="mt-3" />
 
+      {IS_CLOUD && (
+        <div className="mb-3 space-y-1 text-xs text-gray-600 dark:text-gray-400">
+          <div>
+            <Checkbox
+              checked={isTermsAccepted}
+              onChange={(e) => setTermsAccepted(e.target.checked)}
+            >
+              I agree to{' '}
+              <a
+                href="https://databasus.com/terms-of-use-cloud"
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+                style={{ color: 'inherit', textDecoration: 'underline' }}
+              >
+                Terms of Use
+              </a>
+            </Checkbox>
+          </div>
+          <div>
+            <Checkbox
+              checked={isPolicyAccepted}
+              onChange={(e) => setPolicyAccepted(e.target.checked)}
+            >
+              I agree to{' '}
+              <a
+                href="https://databasus.com/privacy-cloud"
+                target="_blank"
+                rel="noreferrer"
+                className="underline"
+                style={{ color: 'inherit', textDecoration: 'underline' }}
+              >
+                Privacy Policy
+              </a>
+            </Checkbox>
+          </div>
+        </div>
+      )}
+
+      <CloudflareTurnstileWidget containerRef={containerRef} />
+
       <Button
-        disabled={isLoading}
+        disabled={
+          isLoading ||
+          (IS_CLOUD && (!isTermsAccepted || !isPolicyAccepted)) ||
+          (!!CLOUDFLARE_TURNSTILE_SITE_KEY && !token)
+        }
         loading={isLoading}
         className="w-full"
         onClick={() => {
@@ -195,6 +262,8 @@ export function SignUpComponent({ onSwitchToSignIn }: SignUpComponentProps): JSX
           </button>
         </div>
       )}
+
+      <div className="mb-10" />
     </div>
   );
 }

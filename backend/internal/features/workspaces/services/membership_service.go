@@ -1,19 +1,22 @@
 package workspaces_services
 
 import (
-	"errors"
 	"fmt"
+	"log/slog"
 
+	"github.com/google/uuid"
+
+	"databasus-backend/internal/config"
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	users_dto "databasus-backend/internal/features/users/dto"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_models "databasus-backend/internal/features/users/models"
 	users_services "databasus-backend/internal/features/users/services"
 	workspaces_dto "databasus-backend/internal/features/workspaces/dto"
+	workspaces_errors "databasus-backend/internal/features/workspaces/errors"
+	workspaces_interfaces "databasus-backend/internal/features/workspaces/interfaces"
 	workspaces_models "databasus-backend/internal/features/workspaces/models"
 	workspaces_repositories "databasus-backend/internal/features/workspaces/repositories"
-
-	"github.com/google/uuid"
 )
 
 type MembershipService struct {
@@ -23,6 +26,8 @@ type MembershipService struct {
 	auditLogService      *audit_logs.AuditLogService
 	workspaceService     *WorkspaceService
 	settingsService      *users_services.SettingsService
+	emailSender          workspaces_interfaces.EmailSender
+	logger               *slog.Logger
 }
 
 func (s *MembershipService) GetMembers(
@@ -34,7 +39,7 @@ func (s *MembershipService) GetMembers(
 		return nil, err
 	}
 	if !canView {
-		return nil, errors.New("insufficient permissions to view workspace members")
+		return nil, workspaces_errors.ErrInsufficientPermissionsToViewMembers
 	}
 
 	members, err := s.membershipRepository.GetWorkspaceMembers(workspaceID)
@@ -74,7 +79,13 @@ func (s *MembershipService) AddMember(
 		}
 
 		if !addedBy.CanInviteUsers(settings) {
-			return nil, errors.New("insufficient permissions to invite users")
+			return nil, workspaces_errors.ErrInsufficientPermissionsToInviteUsers
+		}
+
+		// Get workspace details for email
+		workspace, err := s.workspaceRepository.GetWorkspaceByID(workspaceID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get workspace: %w", err)
 		}
 
 		inviteRequest := &users_dto.InviteUserRequestDTO{
@@ -86,6 +97,14 @@ func (s *MembershipService) AddMember(
 		inviteResponse, err := s.userService.InviteUser(inviteRequest, addedBy)
 		if err != nil {
 			return nil, err
+		}
+
+		// Send invitation email
+		subject := fmt.Sprintf("You've been invited to %s workspace", workspace.Name)
+		body := s.buildInvitationEmailHTML(workspace.Name, addedBy.Name, string(request.Role))
+
+		if err := s.emailSender.SendEmail(request.Email, subject, body); err != nil {
+			s.logger.Error("Failed to send invitation email", "email", request.Email, "error", err)
 		}
 
 		membership := &workspaces_models.WorkspaceMembership{
@@ -118,7 +137,7 @@ func (s *MembershipService) AddMember(
 		workspaceID,
 	)
 	if existingMembership != nil {
-		return nil, errors.New("user is already a member of this workspace")
+		return nil, workspaces_errors.ErrUserAlreadyMember
 	}
 
 	membership := &workspaces_models.WorkspaceMembership{
@@ -153,7 +172,7 @@ func (s *MembershipService) ChangeMemberRole(
 	}
 
 	if memberUserID == changedBy.ID {
-		return errors.New("cannot change your own role")
+		return workspaces_errors.ErrCannotChangeOwnRole
 	}
 
 	existingMembership, err := s.membershipRepository.GetMembershipByUserAndWorkspace(
@@ -161,19 +180,23 @@ func (s *MembershipService) ChangeMemberRole(
 		workspaceID,
 	)
 	if err != nil {
-		return errors.New("user is not a member of this workspace")
+		return workspaces_errors.ErrUserNotMemberOfWorkspace
 	}
 
 	if existingMembership.Role == users_enums.WorkspaceRoleOwner {
-		return errors.New("cannot change owner role")
+		return workspaces_errors.ErrCannotChangeOwnerRole
 	}
 
 	targetUser, err := s.userService.GetUserByID(memberUserID)
 	if err != nil {
-		return errors.New("user not found")
+		return workspaces_errors.ErrUserNotFound
 	}
 
-	if err := s.membershipRepository.UpdateMemberRole(memberUserID, workspaceID, request.Role); err != nil {
+	if err := s.membershipRepository.UpdateMemberRole(
+		memberUserID,
+		workspaceID,
+		request.Role,
+	); err != nil {
 		return fmt.Errorf("failed to update member role: %w", err)
 	}
 
@@ -202,7 +225,7 @@ func (s *MembershipService) RemoveMember(
 	}
 
 	if !canManage {
-		return errors.New("insufficient permissions to remove members")
+		return workspaces_errors.ErrInsufficientPermissionsToRemoveMembers
 	}
 
 	existingMembership, err := s.membershipRepository.GetMembershipByUserAndWorkspace(
@@ -210,11 +233,11 @@ func (s *MembershipService) RemoveMember(
 		workspaceID,
 	)
 	if err != nil {
-		return errors.New("user is not a member of this workspace")
+		return workspaces_errors.ErrUserNotMemberOfWorkspace
 	}
 
 	if existingMembership.Role == users_enums.WorkspaceRoleOwner {
-		return errors.New("cannot remove workspace owner, transfer ownership first")
+		return workspaces_errors.ErrCannotRemoveWorkspaceOwner
 	}
 
 	if existingMembership.Role == users_enums.WorkspaceRoleAdmin {
@@ -223,13 +246,13 @@ func (s *MembershipService) RemoveMember(
 			return err
 		}
 		if !canManageAdmins {
-			return errors.New("only workspace owner can remove admins")
+			return workspaces_errors.ErrOnlyOwnerCanRemoveAdmins
 		}
 	}
 
 	targetUser, err := s.userService.GetUserByID(memberUserID)
 	if err != nil {
-		return errors.New("user not found")
+		return workspaces_errors.ErrUserNotFound
 	}
 
 	if err := s.membershipRepository.RemoveMember(memberUserID, workspaceID); err != nil {
@@ -257,21 +280,21 @@ func (s *MembershipService) TransferOwnership(
 
 	if user.Role != users_enums.UserRoleAdmin &&
 		(currentRole == nil || *currentRole != users_enums.WorkspaceRoleOwner) {
-		return errors.New("only workspace owner or admin can transfer ownership")
+		return workspaces_errors.ErrOnlyOwnerOrAdminCanTransferOwnership
 	}
 
 	newOwner, err := s.userService.GetUserByEmail(request.NewOwnerEmail)
 	if err != nil {
-		return errors.New("new owner not found")
+		return workspaces_errors.ErrNewOwnerNotFound
 	}
 
 	if newOwner == nil {
-		return errors.New("new owner not found")
+		return workspaces_errors.ErrNewOwnerNotFound
 	}
 
 	_, err = s.membershipRepository.GetMembershipByUserAndWorkspace(newOwner.ID, workspaceID)
 	if err != nil {
-		return errors.New("new owner must be a workspace member")
+		return workspaces_errors.ErrNewOwnerMustBeMember
 	}
 
 	currentOwner, err := s.membershipRepository.GetWorkspaceOwner(workspaceID)
@@ -280,14 +303,22 @@ func (s *MembershipService) TransferOwnership(
 	}
 
 	if currentOwner == nil {
-		return errors.New("no current workspace owner found")
+		return workspaces_errors.ErrNoCurrentWorkspaceOwner
 	}
 
-	if err := s.membershipRepository.UpdateMemberRole(newOwner.ID, workspaceID, users_enums.WorkspaceRoleOwner); err != nil {
+	if err := s.membershipRepository.UpdateMemberRole(
+		newOwner.ID,
+		workspaceID,
+		users_enums.WorkspaceRoleOwner,
+	); err != nil {
 		return fmt.Errorf("failed to update new owner role: %w", err)
 	}
 
-	if err := s.membershipRepository.UpdateMemberRole(currentOwner.UserID, workspaceID, users_enums.WorkspaceRoleAdmin); err != nil {
+	if err := s.membershipRepository.UpdateMemberRole(
+		currentOwner.UserID,
+		workspaceID,
+		users_enums.WorkspaceRoleAdmin,
+	); err != nil {
 		return fmt.Errorf("failed to update previous owner role: %w", err)
 	}
 
@@ -311,7 +342,7 @@ func (s *MembershipService) validateCanManageMembership(
 			return err
 		}
 		if !canManageAdmins {
-			return errors.New("only workspace owner can add/manage admins")
+			return workspaces_errors.ErrOnlyOwnerCanAddManageAdmins
 		}
 		return nil
 	}
@@ -322,8 +353,53 @@ func (s *MembershipService) validateCanManageMembership(
 	}
 
 	if !canManageMembership {
-		return errors.New("insufficient permissions to manage members")
+		return workspaces_errors.ErrInsufficientPermissionsToManageMembers
 	}
 
 	return nil
+}
+
+func (s *MembershipService) buildInvitationEmailHTML(
+	workspaceName, inviterName, role string,
+) string {
+	env := config.GetEnv()
+	signUpLink := ""
+	if env.DatabasusURL != "" {
+		signUpLink = fmt.Sprintf(`<p style="margin: 20px 0;">
+			<a href="%s/sign-up" style="display: inline-block; padding: 12px 24px; background-color: #0d6efd; color: white; text-decoration: none; border-radius: 4px;">
+				Sign up
+			</a>
+		</p>`, env.DatabasusURL)
+	} else {
+		signUpLink = `<p style="margin: 20px 0; color: #666;">
+			Please visit your Databasus instance to sign up and access the workspace.
+		</p>`
+	}
+
+	return fmt.Sprintf(`
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+	<div style="background-color: #f8f9fa; border-radius: 8px; padding: 30px; margin: 20px 0;">
+		<h1 style="color: #0d6efd; margin-top: 0;">Workspace Invitation</h1>
+		
+		<p style="font-size: 16px; margin: 20px 0;">
+			<strong>%s</strong> has invited you to join the <strong>%s</strong> workspace as a <strong>%s</strong>.
+		</p>
+		
+		%s
+		
+		<hr style="border: none; border-top: 1px solid #dee2e6; margin: 30px 0;">
+		
+		<p style="font-size: 14px; color: #6c757d; margin: 0;">
+			This is an automated message from Databasus. If you didn't expect this invitation, you can safely ignore this email.
+		</p>
+	</div>
+</body>
+</html>
+	`, inviterName, workspaceName, role, signUpLink)
 }

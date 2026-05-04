@@ -1,10 +1,13 @@
-import { CopyOutlined } from '@ant-design/icons';
-import { App, Button, Input, InputNumber, Switch } from 'antd';
+import { CopyOutlined, DownOutlined, InfoCircleOutlined, UpOutlined } from '@ant-design/icons';
+import { App, Button, Checkbox, Input, InputNumber, Switch, Tooltip } from 'antd';
 import { useEffect, useState } from 'react';
 
+import { IS_CLOUD } from '../../../../constants';
 import { type Database, databaseApi } from '../../../../entity/databases';
 import { MariadbConnectionStringParser } from '../../../../entity/databases/model/mariadb/MariadbConnectionStringParser';
+import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
+import { ClipboardPasteModalComponent } from '../../../../shared/ui';
 
 interface Props {
   database: Database;
@@ -45,53 +48,75 @@ export const EditMariaDbSpecificDataComponent = ({
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
 
+  const hasAdvancedValues = !!database.mariadb?.isExcludeEvents;
+  const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
+
+  const [isShowPasteModal, setIsShowPasteModal] = useState(false);
+
+  const applyConnectionString = (text: string) => {
+    const trimmedText = text.trim();
+
+    if (!trimmedText) {
+      message.error('Clipboard is empty');
+      return;
+    }
+
+    const result = MariadbConnectionStringParser.parse(trimmedText);
+
+    if ('error' in result) {
+      message.error(result.error);
+      return;
+    }
+
+    if (!editingDatabase?.mariadb) return;
+
+    const updatedDatabase: Database = {
+      ...editingDatabase,
+      mariadb: {
+        ...editingDatabase.mariadb,
+        host: result.host,
+        port: result.port,
+        username: result.username,
+        password: result.password,
+        database: result.database,
+        isHttps: result.isHttps,
+      },
+    };
+
+    setEditingDatabase(updatedDatabase);
+    setIsConnectionTested(false);
+    message.success('Connection string parsed successfully');
+  };
+
   const parseFromClipboard = async () => {
+    if (!ClipboardHelper.isClipboardApiAvailable()) {
+      setIsShowPasteModal(true);
+      return;
+    }
+
     try {
-      const text = await navigator.clipboard.readText();
-      const trimmedText = text.trim();
-
-      if (!trimmedText) {
-        message.error('Clipboard is empty');
-        return;
-      }
-
-      const result = MariadbConnectionStringParser.parse(trimmedText);
-
-      if ('error' in result) {
-        message.error(result.error);
-        return;
-      }
-
-      if (!editingDatabase?.mariadb) return;
-
-      const updatedDatabase: Database = {
-        ...editingDatabase,
-        mariadb: {
-          ...editingDatabase.mariadb,
-          host: result.host,
-          port: result.port,
-          username: result.username,
-          password: result.password,
-          database: result.database,
-          isHttps: result.isHttps,
-        },
-      };
-
-      setEditingDatabase(updatedDatabase);
-      setIsConnectionTested(false);
-      message.success('Connection string parsed successfully');
+      const text = await ClipboardHelper.readFromClipboard();
+      applyConnectionString(text);
     } catch {
       message.error('Failed to read clipboard. Please check browser permissions.');
     }
   };
 
   const testConnection = async () => {
-    if (!editingDatabase) return;
+    if (!editingDatabase?.mariadb) return;
     setIsTestingConnection(true);
     setIsConnectionFailed(false);
 
+    const trimmedDatabase = {
+      ...editingDatabase,
+      mariadb: {
+        ...editingDatabase.mariadb,
+        password: editingDatabase.mariadb.password?.trim(),
+      },
+    };
+
     try {
-      await databaseApi.testDatabaseConnectionDirect(editingDatabase);
+      await databaseApi.testDatabaseConnectionDirect(trimmedDatabase);
       setIsConnectionTested(true);
       ToastHelper.showToast({
         title: 'Connection test passed',
@@ -106,13 +131,21 @@ export const EditMariaDbSpecificDataComponent = ({
   };
 
   const saveDatabase = async () => {
-    if (!editingDatabase) return;
+    if (!editingDatabase?.mariadb) return;
+
+    const trimmedDatabase = {
+      ...editingDatabase,
+      mariadb: {
+        ...editingDatabase.mariadb,
+        password: editingDatabase.mariadb.password?.trim(),
+      },
+    };
 
     if (isSaveToApi) {
       setIsSaving(true);
 
       try {
-        await databaseApi.updateDatabase(editingDatabase);
+        await databaseApi.updateDatabase(trimmedDatabase);
       } catch (e) {
         alert((e as Error).message);
       }
@@ -120,7 +153,7 @@ export const EditMariaDbSpecificDataComponent = ({
       setIsSaving(false);
     }
 
-    onSaved(editingDatabase);
+    onSaved(trimmedDatabase);
   };
 
   useEffect(() => {
@@ -180,7 +213,7 @@ export const EditMariaDbSpecificDataComponent = ({
         />
       </div>
 
-      {isLocalhostDb && (
+      {isLocalhostDb && !IS_CLOUD && (
         <div className="mb-1 flex">
           <div className="min-w-[150px]" />
           <div className="max-w-[200px] text-xs text-gray-500 dark:text-gray-400">
@@ -246,7 +279,7 @@ export const EditMariaDbSpecificDataComponent = ({
 
             setEditingDatabase({
               ...editingDatabase,
-              mariadb: { ...editingDatabase.mariadb, password: e.target.value.trim() },
+              mariadb: { ...editingDatabase.mariadb, password: e.target.value },
             });
             setIsConnectionTested(false);
           }}
@@ -281,7 +314,7 @@ export const EditMariaDbSpecificDataComponent = ({
         </div>
       )}
 
-      <div className="mb-3 flex w-full items-center">
+      <div className="mb-1 flex w-full items-center">
         <div className="min-w-[150px]">Use HTTPS</div>
         <Switch
           checked={editingDatabase.mariadb?.isHttps}
@@ -297,6 +330,52 @@ export const EditMariaDbSpecificDataComponent = ({
           size="small"
         />
       </div>
+
+      <div className="mt-4 mb-1 flex items-center">
+        <div
+          className="flex cursor-pointer items-center text-sm text-blue-600 hover:text-blue-800"
+          onClick={() => setShowAdvanced(!isShowAdvanced)}
+        >
+          <span className="mr-2">Advanced settings</span>
+
+          {isShowAdvanced ? (
+            <UpOutlined style={{ fontSize: '12px' }} />
+          ) : (
+            <DownOutlined style={{ fontSize: '12px' }} />
+          )}
+        </div>
+      </div>
+
+      {isShowAdvanced && (
+        <div className="mb-1 flex w-full items-center">
+          <div className="min-w-[150px]">Exclude events</div>
+          <div className="flex items-center">
+            <Checkbox
+              checked={editingDatabase.mariadb?.isExcludeEvents || false}
+              onChange={(e) => {
+                if (!editingDatabase.mariadb) return;
+
+                setEditingDatabase({
+                  ...editingDatabase,
+                  mariadb: {
+                    ...editingDatabase.mariadb,
+                    isExcludeEvents: e.target.checked,
+                  },
+                });
+              }}
+            >
+              Skip events
+            </Checkbox>
+
+            <Tooltip
+              className="cursor-pointer"
+              title="Skip backing up database events. Enable this if the event scheduler is disabled on your MariaDB server."
+            >
+              <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+            </Tooltip>
+          </div>
+        </div>
+      )}
 
       <div className="mt-5 flex">
         {isShowCancelButton && (
@@ -336,12 +415,21 @@ export const EditMariaDbSpecificDataComponent = ({
         )}
       </div>
 
-      {isConnectionFailed && (
+      {isConnectionFailed && !IS_CLOUD && (
         <div className="mt-3 text-sm text-gray-500 dark:text-gray-400">
           If your database uses IP whitelist, make sure Databasus server IP is added to the allowed
           list.
         </div>
       )}
+
+      <ClipboardPasteModalComponent
+        open={isShowPasteModal}
+        onSubmit={(text) => {
+          setIsShowPasteModal(false);
+          applyConnectionString(text);
+        }}
+        onCancel={() => setIsShowPasteModal(false)}
+      />
     </div>
   );
 };

@@ -1,17 +1,19 @@
 package databases
 
 import (
+	"context"
+	"errors"
+	"log/slog"
+	"time"
+
+	"github.com/google/uuid"
+
 	"databasus-backend/internal/features/databases/databases/mariadb"
 	"databasus-backend/internal/features/databases/databases/mongodb"
 	"databasus-backend/internal/features/databases/databases/mysql"
 	"databasus-backend/internal/features/databases/databases/postgresql"
 	"databasus-backend/internal/features/notifiers"
 	"databasus-backend/internal/util/encryption"
-	"errors"
-	"log/slog"
-	"time"
-
-	"github.com/google/uuid"
 )
 
 type Database struct {
@@ -23,19 +25,22 @@ type Database struct {
 	Name        string       `json:"name"        gorm:"column:name;type:text;not null"`
 	Type        DatabaseType `json:"type"        gorm:"column:type;type:text;not null"`
 
-	Postgresql *postgresql.PostgresqlDatabase `json:"postgresql,omitempty" gorm:"foreignKey:DatabaseID"`
-	Mysql      *mysql.MysqlDatabase           `json:"mysql,omitempty"      gorm:"foreignKey:DatabaseID"`
-	Mariadb    *mariadb.MariadbDatabase       `json:"mariadb,omitempty"    gorm:"foreignKey:DatabaseID"`
-	Mongodb    *mongodb.MongodbDatabase       `json:"mongodb,omitempty"    gorm:"foreignKey:DatabaseID"`
+	Postgresql *postgresql.PostgresqlDatabase `json:"postgresql,omitzero" gorm:"foreignKey:DatabaseID"`
+	Mysql      *mysql.MysqlDatabase           `json:"mysql,omitzero"      gorm:"foreignKey:DatabaseID"`
+	Mariadb    *mariadb.MariadbDatabase       `json:"mariadb,omitzero"    gorm:"foreignKey:DatabaseID"`
+	Mongodb    *mongodb.MongodbDatabase       `json:"mongodb,omitzero"    gorm:"foreignKey:DatabaseID"`
 
 	Notifiers []notifiers.Notifier `json:"notifiers" gorm:"many2many:database_notifiers;"`
 
 	// these fields are not reliable, but
 	// they are used for pretty UI
-	LastBackupTime         *time.Time `json:"lastBackupTime,omitempty"         gorm:"column:last_backup_time;type:timestamp with time zone"`
+	LastBackupTime         *time.Time `json:"lastBackupTime,omitzero"          gorm:"column:last_backup_time;type:timestamp with time zone"`
 	LastBackupErrorMessage *string    `json:"lastBackupErrorMessage,omitempty" gorm:"column:last_backup_error_message;type:text"`
 
 	HealthStatus *HealthStatus `json:"healthStatus" gorm:"column:health_status;type:text;not null"`
+
+	AgentToken            *string `json:"-"                     gorm:"column:agent_token;type:text"`
+	IsAgentTokenGenerated bool    `json:"isAgentTokenGenerated" gorm:"column:is_agent_token_generated;not null;default:false"`
 }
 
 func (d *Database) Validate() error {
@@ -70,8 +75,19 @@ func (d *Database) Validate() error {
 }
 
 func (d *Database) ValidateUpdate(old, new Database) error {
+	// Database type cannot be changed after creation — the entire backup
+	// structure (storage files, schedulers, WAL hierarchy, etc.) is tied to
+	// the type at creation time. Recreating that state automatically is
+	// error-prone; it is safer for the user to create a new database and
+	// remove the old one.
 	if old.Type != new.Type {
-		return errors.New("database type is not allowed to change")
+		return errors.New("database type cannot be changed; create a new database instead")
+	}
+
+	if old.Type == DatabaseTypePostgres && old.Postgresql != nil && new.Postgresql != nil {
+		if err := new.Postgresql.ValidateUpdate(old.Postgresql); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -82,6 +98,25 @@ func (d *Database) TestConnection(
 	encryptor encryption.FieldEncryptor,
 ) error {
 	return d.getSpecificDatabase().TestConnection(logger, encryptor, d.ID)
+}
+
+func (d *Database) IsUserReadOnly(
+	ctx context.Context,
+	logger *slog.Logger,
+	encryptor encryption.FieldEncryptor,
+) (bool, []string, error) {
+	switch d.Type {
+	case DatabaseTypePostgres:
+		return d.Postgresql.IsUserReadOnly(ctx, logger, encryptor, d.ID)
+	case DatabaseTypeMysql:
+		return d.Mysql.IsUserReadOnly(ctx, logger, encryptor, d.ID)
+	case DatabaseTypeMariadb:
+		return d.Mariadb.IsUserReadOnly(ctx, logger, encryptor, d.ID)
+	case DatabaseTypeMongodb:
+		return d.Mongodb.IsUserReadOnly(ctx, logger, encryptor, d.ID)
+	default:
+		return false, nil, errors.New("read-only check not supported for this database type")
+	}
 }
 
 func (d *Database) HideSensitiveData() {
@@ -104,21 +139,21 @@ func (d *Database) EncryptSensitiveFields(encryptor encryption.FieldEncryptor) e
 	return nil
 }
 
-func (d *Database) PopulateVersionIfEmpty(
+func (d *Database) PopulateDbData(
 	logger *slog.Logger,
 	encryptor encryption.FieldEncryptor,
 ) error {
 	if d.Postgresql != nil {
-		return d.Postgresql.PopulateVersionIfEmpty(logger, encryptor, d.ID)
+		return d.Postgresql.PopulateDbData(logger, encryptor, d.ID)
 	}
 	if d.Mysql != nil {
-		return d.Mysql.PopulateVersionIfEmpty(logger, encryptor, d.ID)
+		return d.Mysql.PopulateDbData(logger, encryptor, d.ID)
 	}
 	if d.Mariadb != nil {
-		return d.Mariadb.PopulateVersionIfEmpty(logger, encryptor, d.ID)
+		return d.Mariadb.PopulateDbData(logger, encryptor, d.ID)
 	}
 	if d.Mongodb != nil {
-		return d.Mongodb.PopulateVersionIfEmpty(logger, encryptor, d.ID)
+		return d.Mongodb.PopulateDbData(logger, encryptor, d.ID)
 	}
 	return nil
 }
@@ -146,6 +181,12 @@ func (d *Database) Update(incoming *Database) {
 			d.Mongodb.Update(incoming.Mongodb)
 		}
 	}
+}
+
+func (d *Database) IsAgentManagedBackup() bool {
+	return d.Type == DatabaseTypePostgres &&
+		d.Postgresql != nil &&
+		d.Postgresql.BackupType == postgresql.PostgresBackupTypeWalV1
 }
 
 func (d *Database) getSpecificDatabase() DatabaseConnector {

@@ -2,7 +2,7 @@ package webhook_notifier
 
 import (
 	"bytes"
-	"databasus-backend/internal/util/encryption"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +14,8 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"databasus-backend/internal/util/encryption"
 )
 
 type WebhookHeader struct {
@@ -21,6 +23,10 @@ type WebhookHeader struct {
 	Value string `json:"value"`
 }
 
+// Before both WebhookURL, BodyTemplate and HeadersJSON were considered
+// as sensetive data and it was causing issues. Now only headers values
+// considered as sensetive data, but we try to decrypt webhook URL and
+// body template for backward combability
 type WebhookNotifier struct {
 	NotifierID    uuid.UUID     `json:"notifierId"    gorm:"primaryKey;column:notifier_id"`
 	WebhookURL    string        `json:"webhookUrl"    gorm:"not null;column:webhook_url"`
@@ -38,7 +44,6 @@ func (t *WebhookNotifier) TableName() string {
 func (t *WebhookNotifier) BeforeSave(_ *gorm.DB) error {
 	if len(t.Headers) > 0 {
 		data, err := json.Marshal(t.Headers)
-
 		if err != nil {
 			return err
 		}
@@ -55,6 +60,20 @@ func (t *WebhookNotifier) AfterFind(_ *gorm.DB) error {
 	if t.HeadersJSON != "" {
 		if err := json.Unmarshal([]byte(t.HeadersJSON), &t.Headers); err != nil {
 			return err
+		}
+	}
+
+	encryptor := encryption.GetFieldEncryptor()
+
+	if t.WebhookURL != "" {
+		if decrypted, err := encryptor.Decrypt(t.NotifierID, t.WebhookURL); err == nil {
+			t.WebhookURL = decrypted
+		}
+	}
+
+	if t.BodyTemplate != nil && *t.BodyTemplate != "" {
+		if decrypted, err := encryptor.Decrypt(t.NotifierID, *t.BodyTemplate); err == nil {
+			t.BodyTemplate = &decrypted
 		}
 	}
 
@@ -79,22 +98,24 @@ func (t *WebhookNotifier) Send(
 	heading string,
 	message string,
 ) error {
-	webhookURL, err := encryptor.Decrypt(t.NotifierID, t.WebhookURL)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt webhook URL: %w", err)
+	if err := t.decryptHeadersForSending(encryptor); err != nil {
+		return err
 	}
 
 	switch t.WebhookMethod {
 	case WebhookMethodGET:
-		return t.sendGET(webhookURL, heading, message, logger)
+		return t.sendGET(t.WebhookURL, heading, message, logger)
 	case WebhookMethodPOST:
-		return t.sendPOST(webhookURL, heading, message, logger)
+		return t.sendPOST(t.WebhookURL, heading, message, logger)
 	default:
 		return fmt.Errorf("unsupported webhook method: %s", t.WebhookMethod)
 	}
 }
 
 func (t *WebhookNotifier) HideSensitiveData() {
+	for i := range t.Headers {
+		t.Headers[i].Value = ""
+	}
 }
 
 func (t *WebhookNotifier) Update(incoming *WebhookNotifier) {
@@ -105,14 +126,15 @@ func (t *WebhookNotifier) Update(incoming *WebhookNotifier) {
 }
 
 func (t *WebhookNotifier) EncryptSensitiveData(encryptor encryption.FieldEncryptor) error {
-	if t.WebhookURL != "" {
-		encrypted, err := encryptor.Encrypt(t.NotifierID, t.WebhookURL)
+	for i := range t.Headers {
+		if t.Headers[i].Value != "" {
+			encrypted, err := encryptor.Encrypt(t.NotifierID, t.Headers[i].Value)
+			if err != nil {
+				return fmt.Errorf("failed to encrypt header value: %w", err)
+			}
 
-		if err != nil {
-			return fmt.Errorf("failed to encrypt webhook URL: %w", err)
+			t.Headers[i].Value = encrypted
 		}
-
-		t.WebhookURL = encrypted
 	}
 
 	return nil
@@ -125,7 +147,7 @@ func (t *WebhookNotifier) sendGET(webhookURL, heading, message string, logger *s
 		url.QueryEscape(message),
 	)
 
-	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, reqURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create GET request: %w", err)
 	}
@@ -159,7 +181,7 @@ func (t *WebhookNotifier) sendGET(webhookURL, heading, message string, logger *s
 func (t *WebhookNotifier) sendPOST(webhookURL, heading, message string, logger *slog.Logger) error {
 	body := t.buildRequestBody(heading, message)
 
-	req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, webhookURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to create POST request: %w", err)
 	}
@@ -240,4 +262,16 @@ func escapeJSONString(s string) string {
 	}
 
 	return string(b[1 : len(b)-1])
+}
+
+func (t *WebhookNotifier) decryptHeadersForSending(encryptor encryption.FieldEncryptor) error {
+	for i := range t.Headers {
+		if t.Headers[i].Value != "" {
+			if decrypted, err := encryptor.Decrypt(t.NotifierID, t.Headers[i].Value); err == nil {
+				t.Headers[i].Value = decrypted
+			}
+		}
+	}
+
+	return nil
 }

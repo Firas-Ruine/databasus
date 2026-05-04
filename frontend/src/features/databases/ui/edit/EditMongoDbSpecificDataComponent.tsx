@@ -2,9 +2,12 @@ import { CopyOutlined, DownOutlined, InfoCircleOutlined, UpOutlined } from '@ant
 import { App, Button, Input, InputNumber, Switch, Tooltip } from 'antd';
 import { useEffect, useState } from 'react';
 
+import { IS_CLOUD } from '../../../../constants';
 import { type Database, databaseApi } from '../../../../entity/databases';
 import { MongodbConnectionStringParser } from '../../../../entity/databases/model/mongodb/MongodbConnectionStringParser';
+import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
+import { ClipboardPasteModalComponent } from '../../../../shared/ui';
 
 interface Props {
   database: Database;
@@ -45,58 +48,91 @@ export const EditMongoDbSpecificDataComponent = ({
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
 
-  const hasAdvancedValues = !!database.mongodb?.authDatabase;
+  const hasAdvancedValues =
+    !!database.mongodb?.authDatabase ||
+    !!database.mongodb?.isSrv ||
+    !!database.mongodb?.isDirectConnection;
   const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
 
-  const parseFromClipboard = async () => {
-    try {
-      const text = await navigator.clipboard.readText();
-      const trimmedText = text.trim();
+  const [isShowPasteModal, setIsShowPasteModal] = useState(false);
 
-      if (!trimmedText) {
-        message.error('Clipboard is empty');
-        return;
-      }
+  const applyConnectionString = (text: string) => {
+    const trimmedText = text.trim();
 
-      const result = MongodbConnectionStringParser.parse(trimmedText);
+    if (!trimmedText) {
+      message.error('Clipboard is empty');
+      return;
+    }
 
-      if ('error' in result) {
-        message.error(result.error);
-        return;
-      }
+    const result = MongodbConnectionStringParser.parse(trimmedText);
 
-      if (!editingDatabase?.mongodb) return;
+    if ('error' in result) {
+      message.error(result.error);
+      return;
+    }
 
-      const updatedDatabase: Database = {
-        ...editingDatabase,
-        mongodb: {
-          ...editingDatabase.mongodb,
-          host: result.host,
-          port: result.port,
-          username: result.username,
-          password: result.password,
-          database: result.database,
-          authDatabase: result.authDatabase,
-          useTls: result.useTls,
-          cpuCount: 1,
-        },
-      };
+    if (!editingDatabase?.mongodb) return;
 
-      setEditingDatabase(updatedDatabase);
-      setIsConnectionTested(false);
+    const updatedDatabase: Database = {
+      ...editingDatabase,
+      mongodb: {
+        ...editingDatabase.mongodb,
+        host: result.host,
+        port: result.port,
+        username: result.username,
+        password: result.password || '',
+        database: result.database,
+        authDatabase: result.authDatabase,
+        isHttps: result.useTls,
+        isSrv: result.isSrv,
+        isDirectConnection: result.isDirectConnection,
+        cpuCount: 1,
+      },
+    };
+
+    if (result.isSrv || result.isDirectConnection) {
+      setShowAdvanced(true);
+    }
+
+    setEditingDatabase(updatedDatabase);
+    setIsConnectionTested(false);
+
+    if (!result.password) {
+      message.warning('Connection string parsed successfully. Please enter the password manually.');
+    } else {
       message.success('Connection string parsed successfully');
+    }
+  };
+
+  const parseFromClipboard = async () => {
+    if (!ClipboardHelper.isClipboardApiAvailable()) {
+      setIsShowPasteModal(true);
+      return;
+    }
+
+    try {
+      const text = await ClipboardHelper.readFromClipboard();
+      applyConnectionString(text);
     } catch {
       message.error('Failed to read clipboard. Please check browser permissions.');
     }
   };
 
   const testConnection = async () => {
-    if (!editingDatabase) return;
+    if (!editingDatabase?.mongodb) return;
     setIsTestingConnection(true);
     setIsConnectionFailed(false);
 
+    const trimmedDatabase = {
+      ...editingDatabase,
+      mongodb: {
+        ...editingDatabase.mongodb,
+        password: editingDatabase.mongodb.password?.trim(),
+      },
+    };
+
     try {
-      await databaseApi.testDatabaseConnectionDirect(editingDatabase);
+      await databaseApi.testDatabaseConnectionDirect(trimmedDatabase);
       setIsConnectionTested(true);
       ToastHelper.showToast({
         title: 'Connection test passed',
@@ -111,13 +147,21 @@ export const EditMongoDbSpecificDataComponent = ({
   };
 
   const saveDatabase = async () => {
-    if (!editingDatabase) return;
+    if (!editingDatabase?.mongodb) return;
+
+    const trimmedDatabase = {
+      ...editingDatabase,
+      mongodb: {
+        ...editingDatabase.mongodb,
+        password: editingDatabase.mongodb.password?.trim(),
+      },
+    };
 
     if (isSaveToApi) {
       setIsSaving(true);
 
       try {
-        await databaseApi.updateDatabase(editingDatabase);
+        await databaseApi.updateDatabase(trimmedDatabase);
       } catch (e) {
         alert((e as Error).message);
       }
@@ -125,7 +169,7 @@ export const EditMongoDbSpecificDataComponent = ({
       setIsSaving(false);
     }
 
-    onSaved(editingDatabase);
+    onSaved(trimmedDatabase);
   };
 
   useEffect(() => {
@@ -139,9 +183,11 @@ export const EditMongoDbSpecificDataComponent = ({
 
   if (!editingDatabase) return null;
 
+  const isSrvConnection = editingDatabase.mongodb?.isSrv || false;
+
   let isAllFieldsFilled = true;
   if (!editingDatabase.mongodb?.host) isAllFieldsFilled = false;
-  if (!editingDatabase.mongodb?.port) isAllFieldsFilled = false;
+  if (!isSrvConnection && !editingDatabase.mongodb?.port) isAllFieldsFilled = false;
   if (!editingDatabase.mongodb?.username) isAllFieldsFilled = false;
   if (!editingDatabase.id && !editingDatabase.mongodb?.password) isAllFieldsFilled = false;
   if (!editingDatabase.mongodb?.database) isAllFieldsFilled = false;
@@ -185,7 +231,7 @@ export const EditMongoDbSpecificDataComponent = ({
         />
       </div>
 
-      {isLocalhostDb && (
+      {isLocalhostDb && !IS_CLOUD && (
         <div className="mb-1 flex">
           <div className="min-w-[150px]" />
           <div className="max-w-[200px] text-xs text-gray-500 dark:text-gray-400">
@@ -203,25 +249,27 @@ export const EditMongoDbSpecificDataComponent = ({
         </div>
       )}
 
-      <div className="mb-1 flex w-full items-center">
-        <div className="min-w-[150px]">Port</div>
-        <InputNumber
-          type="number"
-          value={editingDatabase.mongodb?.port}
-          onChange={(e) => {
-            if (!editingDatabase.mongodb || e === null) return;
+      {!isSrvConnection && (
+        <div className="mb-1 flex w-full items-center">
+          <div className="min-w-[150px]">Port</div>
+          <InputNumber
+            type="number"
+            value={editingDatabase.mongodb?.port}
+            onChange={(e) => {
+              if (!editingDatabase.mongodb || e === null) return;
 
-            setEditingDatabase({
-              ...editingDatabase,
-              mongodb: { ...editingDatabase.mongodb, port: e },
-            });
-            setIsConnectionTested(false);
-          }}
-          size="small"
-          className="max-w-[200px] grow"
-          placeholder="27017"
-        />
-      </div>
+              setEditingDatabase({
+                ...editingDatabase,
+                mongodb: { ...editingDatabase.mongodb, port: e },
+              });
+              setIsConnectionTested(false);
+            }}
+            size="small"
+            className="max-w-[200px] grow"
+            placeholder="27017"
+          />
+        </div>
+      )}
 
       <div className="mb-1 flex w-full items-center">
         <div className="min-w-[150px]">Username</div>
@@ -251,7 +299,7 @@ export const EditMongoDbSpecificDataComponent = ({
 
             setEditingDatabase({
               ...editingDatabase,
-              mongodb: { ...editingDatabase.mongodb, password: e.target.value.trim() },
+              mongodb: { ...editingDatabase.mongodb, password: e.target.value },
             });
             setIsConnectionTested(false);
           }}
@@ -287,15 +335,15 @@ export const EditMongoDbSpecificDataComponent = ({
       )}
 
       <div className="mb-1 flex w-full items-center">
-        <div className="min-w-[150px]">Use TLS</div>
+        <div className="min-w-[150px]">Use HTTPS</div>
         <Switch
-          checked={editingDatabase.mongodb?.useTls}
+          checked={editingDatabase.mongodb?.isHttps}
           onChange={(checked) => {
             if (!editingDatabase.mongodb) return;
 
             setEditingDatabase({
               ...editingDatabase,
-              mongodb: { ...editingDatabase.mongodb, useTls: checked },
+              mongodb: { ...editingDatabase.mongodb, isHttps: checked },
             });
             setIsConnectionTested(false);
           }}
@@ -309,7 +357,7 @@ export const EditMongoDbSpecificDataComponent = ({
           <InputNumber
             min={1}
             max={16}
-            value={editingDatabase.mongodb?.cpuCount || 1}
+            value={editingDatabase.mongodb?.cpuCount}
             onChange={(value) => {
               if (!editingDatabase.mongodb) return;
 
@@ -349,6 +397,56 @@ export const EditMongoDbSpecificDataComponent = ({
 
       {isShowAdvanced && (
         <>
+          <div className="mb-1 flex w-full items-center">
+            <div className="min-w-[150px]">Use SRV connection</div>
+            <div className="flex items-center">
+              <Switch
+                checked={editingDatabase.mongodb?.isSrv || false}
+                onChange={(checked) => {
+                  if (!editingDatabase.mongodb) return;
+
+                  setEditingDatabase({
+                    ...editingDatabase,
+                    mongodb: { ...editingDatabase.mongodb, isSrv: checked },
+                  });
+                  setIsConnectionTested(false);
+                }}
+                size="small"
+              />
+              <Tooltip
+                className="cursor-pointer"
+                title="Enable for MongoDB Atlas SRV connections (mongodb+srv://). Port is not required for SRV connections."
+              >
+                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+              </Tooltip>
+            </div>
+          </div>
+
+          <div className="mb-1 flex w-full items-center">
+            <div className="min-w-[150px]">Direct connection</div>
+            <div className="flex items-center">
+              <Switch
+                checked={editingDatabase.mongodb?.isDirectConnection || false}
+                onChange={(checked) => {
+                  if (!editingDatabase.mongodb) return;
+
+                  setEditingDatabase({
+                    ...editingDatabase,
+                    mongodb: { ...editingDatabase.mongodb, isDirectConnection: checked },
+                  });
+                  setIsConnectionTested(false);
+                }}
+                size="small"
+              />
+              <Tooltip
+                className="cursor-pointer"
+                title="Connect directly to a single server, skipping replica set discovery. Useful when the server is behind a load balancer, proxy or tunnel."
+              >
+                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+              </Tooltip>
+            </div>
+          </div>
+
           <div className="mb-1 flex w-full items-center">
             <div className="min-w-[150px]">Auth database</div>
             <Input
@@ -408,12 +506,21 @@ export const EditMongoDbSpecificDataComponent = ({
         )}
       </div>
 
-      {isConnectionFailed && (
+      {isConnectionFailed && !IS_CLOUD && (
         <div className="mt-3 text-sm text-gray-500 dark:text-gray-400">
           If your database uses IP whitelist, make sure Databasus server IP is added to the allowed
           list.
         </div>
       )}
+
+      <ClipboardPasteModalComponent
+        open={isShowPasteModal}
+        onSubmit={(text) => {
+          setIsShowPasteModal(false);
+          applyConnectionString(text);
+        }}
+        onCancel={() => setIsShowPasteModal(false)}
+      />
     </div>
   );
 };

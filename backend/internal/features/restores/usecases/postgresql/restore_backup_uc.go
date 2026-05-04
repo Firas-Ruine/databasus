@@ -14,20 +14,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"databasus-backend/internal/config"
-	"databasus-backend/internal/features/backups/backups"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	"databasus-backend/internal/features/backups/backups/encryption"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	pgtypes "databasus-backend/internal/features/databases/databases/postgresql"
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
-	"databasus-backend/internal/features/restores/models"
+	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	util_encryption "databasus-backend/internal/util/encryption"
-	files_utils "databasus-backend/internal/util/files"
 	"databasus-backend/internal/util/tools"
-
-	"github.com/google/uuid"
 )
 
 type RestorePostgresqlBackupUsecase struct {
@@ -36,11 +35,12 @@ type RestorePostgresqlBackupUsecase struct {
 }
 
 func (uc *RestorePostgresqlBackupUsecase) Execute(
+	parentCtx context.Context,
 	originalDB *databases.Database,
 	restoringToDB *databases.Database,
 	backupConfig *backups_config.BackupConfig,
-	restore models.Restore,
-	backup *backups.Backup,
+	restore restores_core.Restore,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 	isExcludeExtensions bool,
 ) error {
@@ -65,33 +65,335 @@ func (uc *RestorePostgresqlBackupUsecase) Execute(
 		return fmt.Errorf("target database name is required for pg_restore")
 	}
 
-	// Use parallel jobs based on CPU count (same as backup)
-	// Cap between 1 and 8 to avoid overwhelming the server
-	parallelJobs := max(1, min(restoringToDB.Postgresql.CpuCount, 8))
+	// Validate CPU count constraint for cloud environments
+	if config.GetEnv().IsCloud && pg.CpuCount > 1 {
+		return fmt.Errorf(
+			"parallel restore (CPU count > 1) is not supported in cloud mode due to storage constraints. Please use CPU count = 1",
+		)
+	}
+
+	pgBin := tools.GetPostgresqlExecutable(pg.Version, "pg_restore")
+
+	// All PostgreSQL backups are now custom format (-Fc)
+	return uc.restoreCustomType(
+		parentCtx,
+		originalDB,
+		pgBin,
+		backup,
+		storage,
+		pg,
+		isExcludeExtensions,
+	)
+}
+
+// restoreCustomType restores a backup in custom type (-Fc)
+func (uc *RestorePostgresqlBackupUsecase) restoreCustomType(
+	parentCtx context.Context,
+	originalDB *databases.Database,
+	pgBin string,
+	backup *backups_core.Backup,
+	storage *storages.Storage,
+	pg *pgtypes.PostgresqlDatabase,
+	isExcludeExtensions bool,
+) error {
+	uc.logger.Info(
+		"Restoring backup in custom type (-Fc)",
+		"backupId",
+		backup.ID,
+		"cpuCount",
+		pg.CpuCount,
+	)
+
+	// If excluding extensions, we must use file-based restore (requires TOC file generation)
+	// Also use file-based restore for parallel jobs (multiple CPUs)
+	if isExcludeExtensions || pg.CpuCount > 1 {
+		return uc.restoreViaFile(
+			parentCtx,
+			originalDB,
+			pgBin,
+			backup,
+			storage,
+			pg,
+			isExcludeExtensions,
+		)
+	}
+
+	// Single CPU without extension exclusion: stream directly via stdin
+	return uc.restoreViaStdin(parentCtx, originalDB, pgBin, backup, storage, pg)
+}
+
+// restoreViaStdin streams backup via stdin for single CPU restore
+func (uc *RestorePostgresqlBackupUsecase) restoreViaStdin(
+	parentCtx context.Context,
+	originalDB *databases.Database,
+	pgBin string,
+	backup *backups_core.Backup,
+	storage *storages.Storage,
+	pg *pgtypes.PostgresqlDatabase,
+) error {
+	uc.logger.Info("Restoring via stdin streaming (CPU=1)", "backupId", backup.ID)
 
 	args := []string{
-		"-Fc",                            // expect custom format (same as backup)
-		"-j", strconv.Itoa(parallelJobs), // parallel jobs based on CPU count
-		"--no-password", // Use environment variable for password, prevent prompts
+		"-Fc", // expect custom type
+		"--no-password",
 		"-h", pg.Host,
 		"-p", strconv.Itoa(pg.Port),
 		"-U", pg.Username,
 		"-d", *pg.Database,
-		"--verbose",   // Add verbose output to help with debugging
-		"--clean",     // Clean (drop) database objects before recreating them
-		"--if-exists", // Use IF EXISTS when dropping objects
-		"--no-owner",  // Skip restoring ownership
-		"--no-acl",    // Skip restoring access privileges (GRANT/REVOKE commands)
+		"--verbose",
+		"--clean",
+		"--if-exists",
+		"--no-owner",
+		"--no-acl",
+	}
+
+	ctx, cancel := context.WithTimeout(parentCtx, 23*time.Hour)
+	defer cancel()
+
+	// Monitor for shutdown and parent cancellation
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-parentCtx.Done():
+				cancel()
+				return
+			case <-ticker.C:
+				if config.IsShouldShutdown() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	// Create temporary .pgpass file for authentication
+	fieldEncryptor := util_encryption.GetFieldEncryptor()
+	decryptedPassword, err := fieldEncryptor.Decrypt(originalDB.ID, pg.Password)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt password: %w", err)
+	}
+
+	pgpassFile, err := uc.createTempPgpassFile(pg, decryptedPassword)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary .pgpass file: %w", err)
+	}
+	defer func() {
+		if pgpassFile != "" {
+			_ = os.RemoveAll(filepath.Dir(pgpassFile))
+		}
+	}()
+
+	// Verify .pgpass file was created successfully
+	if pgpassFile == "" {
+		return fmt.Errorf("temporary .pgpass file was not created")
+	}
+
+	if info, err := os.Stat(pgpassFile); err == nil {
+		uc.logger.Info("Temporary .pgpass file created successfully",
+			"pgpassFile", pgpassFile,
+			"size", info.Size(),
+			"mode", info.Mode(),
+		)
+	} else {
+		return fmt.Errorf("failed to verify .pgpass file: %w", err)
+	}
+
+	// Get backup stream from storage
+	rawReader, err := storage.GetFile(fieldEncryptor, backup.FileName)
+	if err != nil {
+		return fmt.Errorf("failed to get backup file from storage: %w", err)
+	}
+	defer func() {
+		if err := rawReader.Close(); err != nil {
+			uc.logger.Error("Failed to close backup reader", "error", err)
+		}
+	}()
+
+	var backupReader io.Reader = rawReader
+	if backup.Encryption == backups_config.BackupEncryptionEncrypted {
+		// Validate encryption metadata
+		if backup.EncryptionSalt == nil || backup.EncryptionIV == nil {
+			return fmt.Errorf("backup is encrypted but missing encryption metadata")
+		}
+
+		// Get master key
+		masterKey, err := uc.secretKeyService.GetSecretKey()
+		if err != nil {
+			return fmt.Errorf("failed to get master key for decryption: %w", err)
+		}
+
+		// Decode salt and IV from base64
+		salt, err := base64.StdEncoding.DecodeString(*backup.EncryptionSalt)
+		if err != nil {
+			return fmt.Errorf("failed to decode encryption salt: %w", err)
+		}
+
+		iv, err := base64.StdEncoding.DecodeString(*backup.EncryptionIV)
+		if err != nil {
+			return fmt.Errorf("failed to decode encryption IV: %w", err)
+		}
+
+		// Create decryption reader
+		decryptReader, err := encryption.NewDecryptionReader(
+			rawReader,
+			masterKey,
+			backup.ID,
+			salt,
+			iv,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create decryption reader: %w", err)
+		}
+
+		backupReader = decryptReader
+		uc.logger.Info("Using decryption for encrypted backup", "backupId", backup.ID)
+	}
+
+	cmd := exec.CommandContext(ctx, pgBin, args...)
+	uc.logger.Info("Executing PostgreSQL restore command via stdin", "command", cmd.String())
+
+	// Setup environment variables
+	uc.setupPgRestoreEnvironment(cmd, pgpassFile, pg)
+
+	// Verify executable exists and is accessible
+	if _, err := exec.LookPath(pgBin); err != nil {
+		return fmt.Errorf(
+			"PostgreSQL executable not found or not accessible: %s - %w",
+			pgBin,
+			err,
+		)
+	}
+
+	// Create stdin pipe for explicit data pumping
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("stdin pipe: %w", err)
+	}
+
+	// Get stderr to capture any error output
+	pgStderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	// Capture stderr in a separate goroutine
+	stderrCh := make(chan []byte, 1)
+	go func() {
+		stderrOutput, _ := io.ReadAll(pgStderr)
+		stderrCh <- stderrOutput
+	}()
+
+	// Start pg_restore
+	if err = cmd.Start(); err != nil {
+		return fmt.Errorf("start %s: %w", filepath.Base(pgBin), err)
+	}
+
+	// Copy backup data to stdin in a separate goroutine with proper error handling
+	copyErrCh := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(stdinPipe, backupReader)
+		// Close stdin pipe to signal EOF to pg_restore - critical for proper termination
+		closeErr := stdinPipe.Close()
+		switch {
+		case copyErr != nil:
+			copyErrCh <- fmt.Errorf("copy to stdin: %w", copyErr)
+		case closeErr != nil:
+			copyErrCh <- fmt.Errorf("close stdin: %w", closeErr)
+		default:
+			copyErrCh <- nil
+		}
+	}()
+
+	// Wait for the restore to finish
+	waitErr := cmd.Wait()
+	stderrOutput := <-stderrCh
+	copyErr := <-copyErrCh
+
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return fmt.Errorf("restore cancelled")
+		}
+	default:
+	}
+
+	// Check for shutdown before finalizing
+	if config.IsShouldShutdown() {
+		return fmt.Errorf("restore cancelled due to shutdown")
+	}
+
+	// Check for copy errors first - these indicate issues with decryption or data reading
+	if copyErr != nil {
+		return fmt.Errorf("failed to stream backup data to pg_restore: %w", copyErr)
+	}
+
+	if waitErr != nil {
+		// Check for cancellation again
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return fmt.Errorf("restore cancelled")
+			}
+		default:
+		}
+
+		if config.IsShouldShutdown() {
+			return fmt.Errorf("restore cancelled due to shutdown")
+		}
+
+		return uc.handlePgRestoreError(originalDB, waitErr, stderrOutput, pgBin, args, pg)
+	}
+
+	return nil
+}
+
+// restoreViaFile downloads backup and uses parallel jobs for multi-CPU restore
+func (uc *RestorePostgresqlBackupUsecase) restoreViaFile(
+	parentCtx context.Context,
+	originalDB *databases.Database,
+	pgBin string,
+	backup *backups_core.Backup,
+	storage *storages.Storage,
+	pg *pgtypes.PostgresqlDatabase,
+	isExcludeExtensions bool,
+) error {
+	uc.logger.Info(
+		"Restoring via file with parallel jobs",
+		"backupId",
+		backup.ID,
+		"cpuCount",
+		pg.CpuCount,
+	)
+
+	// Use parallel jobs based on CPU count
+	// Cap between 1 and 8 to avoid overwhelming the server
+	parallelJobs := max(1, min(pg.CpuCount, 8))
+
+	args := []string{
+		"-Fc",                            // expect custom type
+		"-j", strconv.Itoa(parallelJobs), // parallel jobs based on CPU count
+		"--no-password",
+		"-h", pg.Host,
+		"-p", strconv.Itoa(pg.Port),
+		"-U", pg.Username,
+		"-d", *pg.Database,
+		"--verbose",
+		"--clean",
+		"--if-exists",
+		"--no-owner",
+		"--no-acl",
 	}
 
 	return uc.restoreFromStorage(
+		parentCtx,
 		originalDB,
-		tools.GetPostgresqlExecutable(
-			pg.Version,
-			"pg_restore",
-			config.GetEnv().EnvMode,
-			config.GetEnv().PostgresesInstallDir,
-		),
+		pgBin,
 		args,
 		pg.Password,
 		backup,
@@ -103,11 +405,12 @@ func (uc *RestorePostgresqlBackupUsecase) Execute(
 
 // restoreFromStorage restores backup data from storage using pg_restore
 func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
+	parentCtx context.Context,
 	database *databases.Database,
 	pgBin string,
 	args []string,
 	password string,
-	backup *backups.Backup,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 	pgConfig *pgtypes.PostgresqlDatabase,
 	isExcludeExtensions bool,
@@ -122,10 +425,10 @@ func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
 		isExcludeExtensions,
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	ctx, cancel := context.WithTimeout(parentCtx, 23*time.Hour)
 	defer cancel()
 
-	// Monitor for shutdown and cancel context if needed
+	// Monitor for shutdown and parent cancellation
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -133,6 +436,9 @@ func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-parentCtx.Done():
+				cancel()
 				return
 			case <-ticker.C:
 				if config.IsShouldShutdown() {
@@ -150,7 +456,7 @@ func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
 	}
 	defer func() {
 		if pgpassFile != "" {
-			_ = os.Remove(pgpassFile)
+			_ = os.RemoveAll(filepath.Dir(pgpassFile))
 		}
 	}()
 
@@ -205,16 +511,9 @@ func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
 // downloadBackupToTempFile downloads backup data from storage to a temporary file
 func (uc *RestorePostgresqlBackupUsecase) downloadBackupToTempFile(
 	ctx context.Context,
-	backup *backups.Backup,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 ) (string, func(), error) {
-	err := files_utils.EnsureDirectories([]string{
-		config.GetEnv().TempFolder,
-	})
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to ensure directories: %w", err)
-	}
-
 	// Create temporary directory for backup data
 	tempDir, err := os.MkdirTemp(config.GetEnv().TempFolder, "restore_"+uuid.New().String())
 	if err != nil {
@@ -237,12 +536,14 @@ func (uc *RestorePostgresqlBackupUsecase) downloadBackupToTempFile(
 		"encrypted",
 		backup.Encryption == backups_config.BackupEncryptionEncrypted,
 	)
+
 	fieldEncryptor := util_encryption.GetFieldEncryptor()
-	rawReader, err := storage.GetFile(fieldEncryptor, backup.ID)
+	rawReader, err := storage.GetFile(fieldEncryptor, backup.FileName)
 	if err != nil {
 		cleanupFunc()
 		return "", nil, fmt.Errorf("failed to get backup file from storage: %w", err)
 	}
+
 	defer func() {
 		if err := rawReader.Close(); err != nil {
 			uc.logger.Error("Failed to close backup reader", "error", err)
@@ -367,12 +668,30 @@ func (uc *RestorePostgresqlBackupUsecase) executePgRestore(
 	waitErr := cmd.Wait()
 	stderrOutput := <-stderrCh
 
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return fmt.Errorf("restore cancelled")
+		}
+	default:
+	}
+
 	// Check for shutdown before finalizing
 	if config.IsShouldShutdown() {
 		return fmt.Errorf("restore cancelled due to shutdown")
 	}
 
 	if waitErr != nil {
+		// Check for cancellation again
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return fmt.Errorf("restore cancelled")
+			}
+		default:
+		}
+
 		if config.IsShouldShutdown() {
 			return fmt.Errorf("restore cancelled due to shutdown")
 		}
@@ -441,10 +760,12 @@ func (uc *RestorePostgresqlBackupUsecase) handlePgRestoreError(
 	)
 
 	// Check for specific PostgreSQL error patterns
-	if exitErr, ok := waitErr.(*exec.ExitError); ok {
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
 		exitCode := exitErr.ExitCode()
 
-		if exitCode == 1 && strings.TrimSpace(stderrStr) == "" {
+		switch {
+		case exitCode == 1 && strings.TrimSpace(stderrStr) == "":
 			errorMsg = fmt.Sprintf(
 				"%s failed with exit status 1 but provided no error details. "+
 					"This often indicates: "+
@@ -459,45 +780,46 @@ func (uc *RestorePostgresqlBackupUsecase) handlePgRestoreError(
 				pgBin,
 				strings.Join(args, " "),
 			)
-		} else if exitCode == -1073741819 { // 0xC0000005 in decimal
+		case exitCode == -1073741819: // 0xC0000005 in decimal
 			errorMsg = fmt.Sprintf(
 				"%s crashed with access violation (0xC0000005). This may indicate incompatible PostgreSQL version, corrupted installation, or connection issues. stderr: %s",
 				filepath.Base(pgBin),
 				stderrStr,
 			)
-		} else if exitCode == 1 || exitCode == 2 {
+		case exitCode == 1 || exitCode == 2:
 			// Check for common connection and authentication issues
-			if containsIgnoreCase(stderrStr, "pg_hba.conf") {
+			switch {
+			case containsIgnoreCase(stderrStr, "pg_hba.conf"):
 				errorMsg = fmt.Sprintf(
 					"PostgreSQL connection rejected by server configuration (pg_hba.conf). stderr: %s",
 					stderrStr,
 				)
-			} else if containsIgnoreCase(stderrStr, "no password supplied") || containsIgnoreCase(stderrStr, "fe_sendauth") {
+			case containsIgnoreCase(stderrStr, "no password supplied") || containsIgnoreCase(stderrStr, "fe_sendauth"):
 				errorMsg = fmt.Sprintf(
 					"PostgreSQL authentication failed - no password supplied. stderr: %s",
 					stderrStr,
 				)
-			} else if containsIgnoreCase(stderrStr, "ssl") && containsIgnoreCase(stderrStr, "connection") {
+			case containsIgnoreCase(stderrStr, "ssl") && containsIgnoreCase(stderrStr, "connection"):
 				errorMsg = fmt.Sprintf(
 					"PostgreSQL SSL connection failed. stderr: %s",
 					stderrStr,
 				)
-			} else if containsIgnoreCase(stderrStr, "connection") && containsIgnoreCase(stderrStr, "refused") {
+			case containsIgnoreCase(stderrStr, "connection") && containsIgnoreCase(stderrStr, "refused"):
 				errorMsg = fmt.Sprintf(
 					"PostgreSQL connection refused. Check if the server is running and accessible. stderr: %s",
 					stderrStr,
 				)
-			} else if containsIgnoreCase(stderrStr, "authentication") || containsIgnoreCase(stderrStr, "password") {
+			case containsIgnoreCase(stderrStr, "authentication") || containsIgnoreCase(stderrStr, "password"):
 				errorMsg = fmt.Sprintf(
 					"PostgreSQL authentication failed. Check username and password. stderr: %s",
 					stderrStr,
 				)
-			} else if containsIgnoreCase(stderrStr, "timeout") {
+			case containsIgnoreCase(stderrStr, "timeout"):
 				errorMsg = fmt.Sprintf(
 					"PostgreSQL connection timeout. stderr: %s",
 					stderrStr,
 				)
-			} else if containsIgnoreCase(stderrStr, "database") && containsIgnoreCase(stderrStr, "does not exist") {
+			case containsIgnoreCase(stderrStr, "database") && containsIgnoreCase(stderrStr, "does not exist"):
 				backupDbName := "unknown"
 				if database.Postgresql != nil && database.Postgresql.Database != nil {
 					backupDbName = *database.Postgresql.Database
@@ -621,7 +943,7 @@ func (uc *RestorePostgresqlBackupUsecase) generateFilteredTocList(
 	}
 
 	// Write filtered TOC to temporary file
-	tocFile, err := os.CreateTemp("", "pg_restore_toc_*.list")
+	tocFile, err := os.CreateTemp(config.GetEnv().TempFolder, "pg_restore_toc_*.list")
 	if err != nil {
 		return "", fmt.Errorf("failed to create TOC list file: %w", err)
 	}
@@ -668,14 +990,22 @@ func (uc *RestorePostgresqlBackupUsecase) createTempPgpassFile(
 		escapedPassword,
 	)
 
-	tempDir, err := os.MkdirTemp("", "pgpass")
+	// Credential files use OS temp dir (/tmp) because some filesystems
+	// (e.g. ZFS on TrueNAS) ignore chmod, causing "group or world access" errors.
+	tempDir, err := os.MkdirTemp(os.TempDir(), "pgpass_"+uuid.New().String())
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary directory: %w", err)
 	}
 
+	if err := os.Chmod(tempDir, 0o700); err != nil {
+		_ = os.RemoveAll(tempDir)
+		return "", fmt.Errorf("failed to set temporary directory permissions: %w", err)
+	}
+
 	pgpassFile := filepath.Join(tempDir, ".pgpass")
-	err = os.WriteFile(pgpassFile, []byte(pgpassContent), 0600)
+	err = os.WriteFile(pgpassFile, []byte(pgpassContent), 0o600)
 	if err != nil {
+		_ = os.RemoveAll(tempDir)
 		return "", fmt.Errorf("failed to write temporary .pgpass file: %w", err)
 	}
 

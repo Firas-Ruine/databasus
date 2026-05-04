@@ -1,16 +1,18 @@
 package config
 
 import (
-	env_utils "databasus-backend/internal/util/env"
-	"databasus-backend/internal/util/logger"
-	"databasus-backend/internal/util/tools"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
 	"github.com/joho/godotenv"
+
+	env_utils "databasus-backend/internal/util/env"
+	"databasus-backend/internal/util/logger"
+	"databasus-backend/internal/util/tools"
 )
 
 var log = logger.GetLogger()
@@ -21,21 +23,48 @@ const (
 )
 
 type EnvVariables struct {
-	IsTesting            bool
-	DatabaseDsn          string            `env:"DATABASE_DSN"         required:"true"`
-	EnvMode              env_utils.EnvMode `env:"ENV_MODE"             required:"true"`
-	PostgresesInstallDir string            `env:"POSTGRES_INSTALL_DIR"`
-	MysqlInstallDir      string            `env:"MYSQL_INSTALL_DIR"`
-	MariadbInstallDir    string            `env:"MARIADB_INSTALL_DIR"`
-	MongodbInstallDir    string            `env:"MONGODB_INSTALL_DIR"`
+	IsTesting bool
+	EnvMode   env_utils.EnvMode `env:"ENV_MODE" required:"true"`
 
-	DataFolder    string
-	TempFolder    string
-	SecretKeyPath string
+	// Internal database
+	DatabaseDsn string `env:"DATABASE_DSN" required:"true"`
+	// Internal Valkey
+	ValkeyHost     string `env:"VALKEY_HOST"     required:"true"`
+	ValkeyPort     string `env:"VALKEY_PORT"     required:"true"`
+	ValkeyUsername string `env:"VALKEY_USERNAME"`
+	ValkeyPassword string `env:"VALKEY_PASSWORD"`
+	ValkeyIsSsl    bool   `env:"VALKEY_IS_SSL"   required:"true"`
 
-	TestGoogleDriveClientID     string `env:"TEST_GOOGLE_DRIVE_CLIENT_ID"`
-	TestGoogleDriveClientSecret string `env:"TEST_GOOGLE_DRIVE_CLIENT_SECRET"`
-	TestGoogleDriveTokenJSON    string `env:"TEST_GOOGLE_DRIVE_TOKEN_JSON"`
+	IsCloud       bool   `env:"IS_CLOUD"`
+	TestLocalhost string `env:"TEST_LOCALHOST"`
+
+	ShowDbInstallationVerificationLogs bool `env:"SHOW_DB_INSTALLATION_VERIFICATION_LOGS"`
+
+	IsManyNodesMode          bool `env:"IS_MANY_NODES_MODE"`
+	IsPrimaryNode            bool `env:"IS_PRIMARY_NODE"`
+	IsProcessingNode         bool `env:"IS_PROCESSING_NODE"`
+	NodeNetworkThroughputMBs int  `env:"NODE_NETWORK_THROUGHPUT_MBPS"`
+
+	DataFolder            string
+	TempFolder            string
+	SecretKeyPath         string
+	TelemetryInstancePath string
+
+	IsDisableAnonymousTelemetry bool `env:"IS_DISABLE_ANONYMOUS_TELEMETRY"`
+
+	// Billing (tax-exclusive)
+	PricePerGBCents int64 `env:"PRICE_PER_GB_CENTS"`
+	MinStorageGB    int
+	MaxStorageGB    int
+	TrialDuration   time.Duration
+	TrialStorageGB  int
+	GracePeriod     time.Duration
+	// Paddle billing
+	IsPaddleSandbox     bool   `env:"IS_PADDLE_SANDBOX"`
+	PaddleApiKey        string `env:"PADDLE_API_KEY"`
+	PaddleWebhookSecret string `env:"PADDLE_WEBHOOK_SECRET"`
+	PaddlePriceID       string `env:"PADDLE_PRICE_ID"`
+	PaddleClientToken   string `env:"PADDLE_CLIENT_TOKEN"`
 
 	TestPostgres12Port string `env:"TEST_POSTGRES_12_PORT"`
 	TestPostgres13Port string `env:"TEST_POSTGRES_13_PORT"`
@@ -71,7 +100,6 @@ type EnvVariables struct {
 	TestMariadb118Port  string `env:"TEST_MARIADB_118_PORT"`
 	TestMariadb120Port  string `env:"TEST_MARIADB_120_PORT"`
 
-	TestMongodb40Port string `env:"TEST_MONGODB_40_PORT"`
 	TestMongodb42Port string `env:"TEST_MONGODB_42_PORT"`
 	TestMongodb44Port string `env:"TEST_MONGODB_44_PORT"`
 	TestMongodb50Port string `env:"TEST_MONGODB_50_PORT"`
@@ -85,30 +113,31 @@ type EnvVariables struct {
 	GoogleClientID     string `env:"GOOGLE_CLIENT_ID"`
 	GoogleClientSecret string `env:"GOOGLE_CLIENT_SECRET"`
 
-	// testing Telegram
-	TestTelegramBotToken string `env:"TEST_TELEGRAM_BOT_TOKEN"`
-	TestTelegramChatID   string `env:"TEST_TELEGRAM_CHAT_ID"`
+	// Cloudflare Turnstile
+	CloudflareTurnstileSecretKey string `env:"CLOUDFLARE_TURNSTILE_SECRET_KEY"`
+	CloudflareTurnstileSiteKey   string `env:"CLOUDFLARE_TURNSTILE_SITE_KEY"`
 
-	// testing Supabase
-	TestSupabaseHost     string `env:"TEST_SUPABASE_HOST"`
-	TestSupabasePort     string `env:"TEST_SUPABASE_PORT"`
-	TestSupabaseUsername string `env:"TEST_SUPABASE_USERNAME"`
-	TestSupabasePassword string `env:"TEST_SUPABASE_PASSWORD"`
-	TestSupabaseDatabase string `env:"TEST_SUPABASE_DATABASE"`
+	// SMTP configuration (optional)
+	SMTPHost     string `env:"SMTP_HOST"`
+	SMTPPort     int    `env:"SMTP_PORT"`
+	SMTPUser     string `env:"SMTP_USER"`
+	SMTPPassword string `env:"SMTP_PASSWORD"`
+	SMTPFrom     string `env:"SMTP_FROM"`
+
+	// Application URL (optional) - used for email links
+	DatabasusURL string `env:"DATABASUS_URL"`
 }
 
-var (
-	env  EnvVariables
-	once sync.Once
-)
+var env EnvVariables
 
-func GetEnv() EnvVariables {
-	once.Do(loadEnvVariables)
-	return env
+var initEnv = sync.OnceFunc(loadEnvVariables)
+
+func GetEnv() *EnvVariables {
+	initEnv()
+	return &env
 }
 
 func loadEnvVariables() {
-	// Get current working directory
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Warn("could not get current working directory", "error", err)
@@ -129,25 +158,18 @@ func loadEnvVariables() {
 		backendRoot = parent
 	}
 
-	envPaths := []string{
-		filepath.Join(cwd, ".env"),
-		filepath.Join(backendRoot, ".env"),
-	}
+	envPath := filepath.Join(filepath.Dir(backendRoot), ".env")
 
-	var loaded bool
-	for _, path := range envPaths {
-		log.Info("Trying to load .env", "path", path)
-		if err := godotenv.Load(path); err == nil {
-			log.Info("Successfully loaded .env", "path", path)
-			loaded = true
-			break
-		}
-	}
-
-	if !loaded {
-		log.Error("Error loading .env file: could not find .env in any location")
+	log.Info("Trying to load .env", "path", envPath)
+	if err := godotenv.Load(envPath); err != nil {
+		log.Error("Error loading .env file from repo root", "path", envPath, "error", err)
 		os.Exit(1)
 	}
+	log.Info("Successfully loaded .env", "path", envPath)
+
+	// Empty values for non-string fields (e.g. SMTP_PORT=) crash cleanenv's
+	// strconv parsing. Drop them so cleanenv falls back to the Go zero value.
+	unsetEmptyEnvVars()
 
 	err = cleanenv.ReadEnv(&env)
 	if err != nil {
@@ -155,11 +177,34 @@ func loadEnvVariables() {
 		os.Exit(1)
 	}
 
+	if env.SMTPHost != "" && env.SMTPPort <= 0 {
+		log.Error("SMTP_PORT must be a positive integer when SMTP_HOST is set", "value", env.SMTPPort)
+		os.Exit(1)
+	}
+
+	// Set default value for ShowDbInstallationVerificationLogs if not defined
+	if os.Getenv("SHOW_DB_INSTALLATION_VERIFICATION_LOGS") == "" {
+		env.ShowDbInstallationVerificationLogs = true
+	}
+
+	// Set default value for IsCloud if not defined
+	if os.Getenv("IS_CLOUD") == "" {
+		env.IsCloud = false
+	}
+
 	for _, arg := range os.Args {
 		if strings.Contains(arg, "test") {
 			env.IsTesting = true
 			break
 		}
+	}
+
+	// Check for external database override
+	if externalDsn := os.Getenv("DANGEROUS_EXTERNAL_DATABASE_DSN"); externalDsn != "" {
+		log.Warn(
+			"Using DANGEROUS_EXTERNAL_DATABASE_DSN - connecting to external database instead of internal PostgreSQL",
+		)
+		env.DatabaseDsn = externalDsn
 	}
 
 	if env.DatabaseDsn == "" {
@@ -177,23 +222,60 @@ func loadEnvVariables() {
 	}
 	log.Info("ENV_MODE loaded", "mode", env.EnvMode)
 
-	env.PostgresesInstallDir = filepath.Join(backendRoot, "tools", "postgresql")
-	tools.VerifyPostgresesInstallation(log, env.EnvMode, env.PostgresesInstallDir)
+	tools.LogAndExitIfClientToolsBroken(log, env.ShowDbInstallationVerificationLogs)
 
-	env.MysqlInstallDir = filepath.Join(backendRoot, "tools", "mysql")
-	tools.VerifyMysqlInstallation(log, env.EnvMode, env.MysqlInstallDir)
+	if env.NodeNetworkThroughputMBs == 0 {
+		env.NodeNetworkThroughputMBs = 125 // 1 Gbit/s
+	}
 
-	env.MariadbInstallDir = filepath.Join(backendRoot, "tools", "mariadb")
-	tools.VerifyMariadbInstallation(log, env.EnvMode, env.MariadbInstallDir)
+	if !env.IsManyNodesMode {
+		env.IsPrimaryNode = true
+		env.IsProcessingNode = true
+	}
 
-	env.MongodbInstallDir = filepath.Join(backendRoot, "tools", "mongodb")
-	tools.VerifyMongodbInstallation(log, env.EnvMode, env.MongodbInstallDir)
+	if env.TestLocalhost == "" {
+		env.TestLocalhost = "localhost"
+	}
+
+	// Valkey
+	if env.ValkeyHost == "" {
+		log.Error("VALKEY_HOST is empty")
+		os.Exit(1)
+	}
+	if env.ValkeyPort == "" {
+		log.Error("VALKEY_PORT is empty")
+		os.Exit(1)
+	}
+
+	// Check for external Valkey override
+	if externalValkeyHost := os.Getenv("DANGEROUS_VALKEY_HOST"); externalValkeyHost != "" {
+		log.Warn(
+			"Using DANGEROUS_VALKEY_* variables - connecting to external Valkey instead of internal instance",
+		)
+		env.ValkeyHost = externalValkeyHost
+
+		if externalValkeyPort := os.Getenv("DANGEROUS_VALKEY_PORT"); externalValkeyPort != "" {
+			env.ValkeyPort = externalValkeyPort
+		}
+		if externalValkeyUsername := os.Getenv("DANGEROUS_VALKEY_USERNAME"); externalValkeyUsername != "" {
+			env.ValkeyUsername = externalValkeyUsername
+		}
+		if externalValkeyPassword := os.Getenv("DANGEROUS_VALKEY_PASSWORD"); externalValkeyPassword != "" {
+			env.ValkeyPassword = externalValkeyPassword
+		}
+		if externalValkeyIsSsl := os.Getenv("DANGEROUS_VALKEY_IS_SSL"); externalValkeyIsSsl != "" {
+			env.ValkeyIsSsl = externalValkeyIsSsl == "true"
+		}
+	}
 
 	// Store the data and temp folders one level below the root
 	// (projectRoot/databasus-data -> /databasus-data)
 	env.DataFolder = filepath.Join(filepath.Dir(backendRoot), "databasus-data", "backups")
 	env.TempFolder = filepath.Join(filepath.Dir(backendRoot), "databasus-data", "temp")
 	env.SecretKeyPath = filepath.Join(filepath.Dir(backendRoot), "databasus-data", "secret.key")
+	env.TelemetryInstancePath = filepath.Join(
+		filepath.Dir(backendRoot), "databasus-data", "instance.json",
+	)
 
 	if env.IsTesting {
 		if env.TestPostgres12Port == "" {
@@ -244,16 +326,54 @@ func loadEnvVariables() {
 			os.Exit(1)
 		}
 
-		if env.TestTelegramBotToken == "" {
-			log.Error("TEST_TELEGRAM_BOT_TOKEN is empty")
+	}
+
+	// Billing
+	if env.IsCloud {
+		if env.PricePerGBCents <= 0 {
+			log.Error("PRICE_PER_GB_CENTS must be a positive integer in cloud mode", "value", env.PricePerGBCents)
 			os.Exit(1)
 		}
 
-		if env.TestTelegramChatID == "" {
-			log.Error("TEST_TELEGRAM_CHAT_ID is empty")
+		if env.PaddleApiKey == "" {
+			log.Error("PADDLE_API_KEY is empty")
+			os.Exit(1)
+		}
+
+		if env.PaddleWebhookSecret == "" {
+			log.Error("PADDLE_WEBHOOK_SECRET is empty")
+			os.Exit(1)
+		}
+
+		if env.PaddlePriceID == "" {
+			log.Error("PADDLE_PRICE_ID is empty")
+			os.Exit(1)
+		}
+
+		if env.PaddleClientToken == "" {
+			log.Error("PADDLE_CLIENT_TOKEN is empty")
 			os.Exit(1)
 		}
 	}
 
+	env.MinStorageGB = 20
+	env.MaxStorageGB = 10_000
+	env.TrialDuration = 24 * time.Hour
+	env.TrialStorageGB = 20
+	env.GracePeriod = 30 * 24 * time.Hour
+
 	log.Info("Environment variables loaded successfully!")
+}
+
+func unsetEmptyEnvVars() {
+	for _, kv := range os.Environ() {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+
+		if value == "" {
+			_ = os.Unsetenv(key)
+		}
+	}
 }

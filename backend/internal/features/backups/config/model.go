@@ -1,14 +1,16 @@
 package backups_config
 
 import (
-	"databasus-backend/internal/features/intervals"
-	"databasus-backend/internal/features/storages"
-	"databasus-backend/internal/util/period"
 	"errors"
 	"strings"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+
+	"databasus-backend/internal/config"
+	"databasus-backend/internal/features/intervals"
+	"databasus-backend/internal/features/storages"
+	"databasus-backend/internal/util/period"
 )
 
 type BackupConfig struct {
@@ -16,10 +18,18 @@ type BackupConfig struct {
 
 	IsBackupsEnabled bool `json:"isBackupsEnabled" gorm:"column:is_backups_enabled;type:boolean;not null"`
 
-	StorePeriod period.Period `json:"storePeriod" gorm:"column:store_period;type:text;not null"`
+	RetentionPolicyType RetentionPolicyType `json:"retentionPolicyType" gorm:"column:retention_policy_type;type:text;not null;default:'TIME_PERIOD'"`
+	RetentionTimePeriod period.TimePeriod   `json:"retentionTimePeriod" gorm:"column:retention_time_period;type:text;not null;default:''"`
 
-	BackupIntervalID uuid.UUID           `json:"backupIntervalId"         gorm:"column:backup_interval_id;type:uuid;not null"`
-	BackupInterval   *intervals.Interval `json:"backupInterval,omitempty" gorm:"foreignKey:BackupIntervalID"`
+	RetentionCount     int `json:"retentionCount"     gorm:"column:retention_count;type:int;not null;default:0"`
+	RetentionGfsHours  int `json:"retentionGfsHours"  gorm:"column:retention_gfs_hours;type:int;not null;default:0"`
+	RetentionGfsDays   int `json:"retentionGfsDays"   gorm:"column:retention_gfs_days;type:int;not null;default:0"`
+	RetentionGfsWeeks  int `json:"retentionGfsWeeks"  gorm:"column:retention_gfs_weeks;type:int;not null;default:0"`
+	RetentionGfsMonths int `json:"retentionGfsMonths" gorm:"column:retention_gfs_months;type:int;not null;default:0"`
+	RetentionGfsYears  int `json:"retentionGfsYears"  gorm:"column:retention_gfs_years;type:int;not null;default:0"`
+
+	BackupIntervalID uuid.UUID           `json:"backupIntervalId"        gorm:"column:backup_interval_id;type:uuid;not null"`
+	BackupInterval   *intervals.Interval `json:"backupInterval,omitzero" gorm:"foreignKey:BackupIntervalID"`
 
 	Storage   *storages.Storage `json:"storage"   gorm:"foreignKey:StorageID"`
 	StorageID *uuid.UUID        `json:"storageId" gorm:"column:storage_id;type:uuid;"`
@@ -71,13 +81,12 @@ func (b *BackupConfig) AfterFind(tx *gorm.DB) error {
 }
 
 func (b *BackupConfig) Validate() error {
-	// Backup interval is required either as ID or as object
 	if b.BackupIntervalID == uuid.Nil && b.BackupInterval == nil {
 		return errors.New("backup interval is required")
 	}
 
-	if b.StorePeriod == "" {
-		return errors.New("store period is required")
+	if err := b.validateRetentionPolicy(); err != nil {
+		return err
 	}
 
 	if b.IsRetryIfFailed && b.MaxFailedTriesCount <= 0 {
@@ -89,6 +98,12 @@ func (b *BackupConfig) Validate() error {
 		return errors.New("encryption must be NONE or ENCRYPTED")
 	}
 
+	if config.GetEnv().IsCloud {
+		if b.Encryption != BackupEncryptionEncrypted {
+			return errors.New("encryption is mandatory for cloud storage")
+		}
+	}
+
 	return nil
 }
 
@@ -96,7 +111,14 @@ func (b *BackupConfig) Copy(newDatabaseID uuid.UUID) *BackupConfig {
 	return &BackupConfig{
 		DatabaseID:          newDatabaseID,
 		IsBackupsEnabled:    b.IsBackupsEnabled,
-		StorePeriod:         b.StorePeriod,
+		RetentionPolicyType: b.RetentionPolicyType,
+		RetentionTimePeriod: b.RetentionTimePeriod,
+		RetentionCount:      b.RetentionCount,
+		RetentionGfsHours:   b.RetentionGfsHours,
+		RetentionGfsDays:    b.RetentionGfsDays,
+		RetentionGfsWeeks:   b.RetentionGfsWeeks,
+		RetentionGfsMonths:  b.RetentionGfsMonths,
+		RetentionGfsYears:   b.RetentionGfsYears,
 		BackupIntervalID:    uuid.Nil,
 		BackupInterval:      b.BackupInterval.Copy(),
 		StorageID:           b.StorageID,
@@ -105,4 +127,29 @@ func (b *BackupConfig) Copy(newDatabaseID uuid.UUID) *BackupConfig {
 		MaxFailedTriesCount: b.MaxFailedTriesCount,
 		Encryption:          b.Encryption,
 	}
+}
+
+func (b *BackupConfig) validateRetentionPolicy() error {
+	switch b.RetentionPolicyType {
+	case RetentionPolicyTypeTimePeriod, "":
+		if b.RetentionTimePeriod == "" {
+			return errors.New("retention time period is required")
+		}
+
+	case RetentionPolicyTypeCount:
+		if b.RetentionCount <= 0 {
+			return errors.New("retention count must be greater than 0")
+		}
+
+	case RetentionPolicyTypeGFS:
+		if b.RetentionGfsHours <= 0 && b.RetentionGfsDays <= 0 && b.RetentionGfsWeeks <= 0 &&
+			b.RetentionGfsMonths <= 0 && b.RetentionGfsYears <= 0 {
+			return errors.New("at least one GFS retention field must be greater than 0")
+		}
+
+	default:
+		return errors.New("invalid retention policy type")
+	}
+
+	return nil
 }

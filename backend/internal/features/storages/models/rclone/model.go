@@ -3,7 +3,6 @@ package rclone_storage
 import (
 	"bufio"
 	"context"
-	"databasus-backend/internal/util/encryption"
 	"errors"
 	"fmt"
 	"io"
@@ -13,15 +12,17 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/rclone/rclone/backend/all"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/operations"
 
-	_ "github.com/rclone/rclone/backend/all"
+	"databasus-backend/internal/util/encryption"
 )
 
 const (
 	rcloneOperationTimeout = 30 * time.Second
+	rcloneDeleteTimeout    = 30 * time.Second
 )
 
 var rcloneConfigMu sync.Mutex
@@ -40,7 +41,7 @@ func (r *RcloneStorage) SaveFile(
 	ctx context.Context,
 	encryptor encryption.FieldEncryptor,
 	logger *slog.Logger,
-	fileID uuid.UUID,
+	fileName string,
 	file io.Reader,
 ) error {
 	select {
@@ -49,28 +50,28 @@ func (r *RcloneStorage) SaveFile(
 	default:
 	}
 
-	logger.Info("Starting to save file to rclone storage", "fileId", fileID.String())
+	logger.Info("Starting to save file to rclone storage", "fileName", fileName)
 
 	remoteFs, err := r.getFs(ctx, encryptor)
 	if err != nil {
-		logger.Error("Failed to create rclone filesystem", "fileId", fileID.String(), "error", err)
+		logger.Error("Failed to create rclone filesystem", "fileName", fileName, "error", err)
 		return fmt.Errorf("failed to create rclone filesystem: %w", err)
 	}
 
-	filePath := r.getFilePath(fileID.String())
-	logger.Debug("Uploading file via rclone", "fileId", fileID.String(), "filePath", filePath)
+	filePath := r.getFilePath(fileName)
+	logger.Debug("Uploading file via rclone", "fileName", fileName, "filePath", filePath)
 
 	_, err = operations.Rcat(ctx, remoteFs, filePath, io.NopCloser(file), time.Now().UTC(), nil)
 	if err != nil {
 		select {
 		case <-ctx.Done():
-			logger.Info("Rclone upload cancelled", "fileId", fileID.String())
+			logger.Info("Rclone upload cancelled", "fileName", fileName)
 			return ctx.Err()
 		default:
 			logger.Error(
 				"Failed to upload file via rclone",
-				"fileId",
-				fileID.String(),
+				"fileName",
+				fileName,
 				"error",
 				err,
 			)
@@ -80,8 +81,8 @@ func (r *RcloneStorage) SaveFile(
 
 	logger.Info(
 		"Successfully saved file to rclone storage",
-		"fileId",
-		fileID.String(),
+		"fileName",
+		fileName,
 		"filePath",
 		filePath,
 	)
@@ -90,7 +91,7 @@ func (r *RcloneStorage) SaveFile(
 
 func (r *RcloneStorage) GetFile(
 	encryptor encryption.FieldEncryptor,
-	fileID uuid.UUID,
+	fileName string,
 ) (io.ReadCloser, error) {
 	ctx := context.Background()
 
@@ -99,7 +100,7 @@ func (r *RcloneStorage) GetFile(
 		return nil, fmt.Errorf("failed to create rclone filesystem: %w", err)
 	}
 
-	filePath := r.getFilePath(fileID.String())
+	filePath := r.getFilePath(fileName)
 
 	obj, err := remoteFs.NewObject(ctx, filePath)
 	if err != nil {
@@ -114,15 +115,16 @@ func (r *RcloneStorage) GetFile(
 	return reader, nil
 }
 
-func (r *RcloneStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileID uuid.UUID) error {
-	ctx := context.Background()
+func (r *RcloneStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), rcloneDeleteTimeout)
+	defer cancel()
 
 	remoteFs, err := r.getFs(ctx, encryptor)
 	if err != nil {
 		return fmt.Errorf("failed to create rclone filesystem: %w", err)
 	}
 
-	filePath := r.getFilePath(fileID.String())
+	filePath := r.getFilePath(fileName)
 
 	obj, err := remoteFs.NewObject(ctx, filePath)
 	if err != nil {
@@ -140,6 +142,27 @@ func (r *RcloneStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileID u
 func (r *RcloneStorage) Validate(encryptor encryption.FieldEncryptor) error {
 	if r.ConfigContent == "" {
 		return errors.New("rclone config content is required")
+	}
+
+	configContent, err := encryptor.Decrypt(r.StorageID, r.ConfigContent)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt rclone config content: %w", err)
+	}
+
+	parsedConfig, err := parseConfigContent(configContent)
+	if err != nil {
+		return fmt.Errorf("failed to parse rclone config: %w", err)
+	}
+
+	if len(parsedConfig) == 0 {
+		return errors.New("rclone config must contain at least one remote section")
+	}
+
+	if len(parsedConfig) > 1 {
+		return fmt.Errorf(
+			"rclone config must contain exactly one remote section, but found %d; create a separate storage for each remote",
+			len(parsedConfig),
+		)
 	}
 
 	return nil
@@ -226,6 +249,13 @@ func (r *RcloneStorage) getFs(
 
 	if len(parsedConfig) == 0 {
 		return nil, errors.New("rclone config must contain at least one remote section")
+	}
+
+	if len(parsedConfig) > 1 {
+		return nil, fmt.Errorf(
+			"rclone config must contain exactly one remote section, but found %d; create a separate storage for each remote",
+			len(parsedConfig),
+		)
 	}
 
 	var remoteName string

@@ -1,8 +1,11 @@
 import { accessTokenHelper } from '.';
+import { IS_CLOUD } from '../../constants';
+import { RateLimiter } from './RateLimiter';
 import RequestOptions from './RequestOptions';
 
-const REPEAT_TRIES_COUNT = 10;
+const REPEAT_TRIES_COUNT = 30;
 const REPEAT_INTERVAL_MS = 3_000;
+const rateLimiter = new RateLimiter(IS_CLOUD ? 5 : 30, 1_000);
 
 const handleOrThrowMessageIfResponseError = async (
   url: string,
@@ -41,6 +44,8 @@ const makeRequest = async (
   optionsWrapper: RequestOptions,
   currentTry = 0,
 ): Promise<Response> => {
+  await rateLimiter.acquire();
+
   try {
     const response = await fetch(url, optionsWrapper.toRequestInit());
     await handleOrThrowMessageIfResponseError(url, response);
@@ -174,6 +179,25 @@ export const apiHelper = {
     );
 
     return response.blob();
+  },
+
+  fetchGetBlobWithHeaders: async (
+    url: string,
+    requestOptions?: RequestOptions,
+    isRetryOnError = false,
+  ): Promise<{ blob: Blob; headers: Headers }> => {
+    const optionsWrapper = (requestOptions ?? new RequestOptions())
+      .addHeader('Access-Control-Allow-Methods', 'GET')
+      .addHeader('Authorization', accessTokenHelper.getAccessToken());
+
+    const response = await makeRequest(
+      url,
+      optionsWrapper,
+      isRetryOnError ? 0 : REPEAT_TRIES_COUNT,
+    );
+
+    const blob = await response.blob();
+    return { blob, headers: response.headers };
   },
 
   fetchPutJson: async <T>(

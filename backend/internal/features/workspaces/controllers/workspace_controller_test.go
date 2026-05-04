@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	users_dto "databasus-backend/internal/features/users/dto"
 	users_enums "databasus-backend/internal/features/users/enums"
@@ -15,9 +18,6 @@ import (
 	workspaces_models "databasus-backend/internal/features/workspaces/models"
 	workspaces_testing "databasus-backend/internal/features/workspaces/testing"
 	test_utils "databasus-backend/internal/util/testing"
-
-	"github.com/google/uuid"
-	"github.com/stretchr/testify/assert"
 )
 
 func Test_CreateWorkspace_PermissionsEnforced(t *testing.T) {
@@ -91,6 +91,10 @@ func Test_CreateWorkspace_PermissionsEnforced(t *testing.T) {
 				assert.Equal(t, workspaceName, response.Name)
 				assert.NotEqual(t, uuid.Nil, response.ID)
 				assert.Equal(t, users_enums.WorkspaceRoleOwner, *response.UserRole)
+
+				// Cleanup created workspace
+				workspace := &workspaces_models.Workspace{ID: response.ID}
+				workspaces_testing.RemoveTestWorkspace(workspace, router)
 			} else {
 				resp := test_utils.MakePostRequest(
 					t,
@@ -100,7 +104,11 @@ func Test_CreateWorkspace_PermissionsEnforced(t *testing.T) {
 					request,
 					tt.expectedStatusCode,
 				)
-				assert.Contains(t, string(resp.Body), "insufficient permissions to create workspaces")
+				assert.Contains(
+					t,
+					string(resp.Body),
+					"insufficient permissions to create workspaces",
+				)
 			}
 		})
 	}
@@ -156,11 +164,14 @@ func Test_GetUserWorkspaces_WhenUserHasWorkspaces_ReturnsWorkspacesList(t *testi
 		user.Token,
 		router,
 	)
+	defer workspaces_testing.RemoveTestWorkspace(workspace1, router)
+
 	workspace2, _ := workspaces_testing.CreateTestWorkspaceWithToken(
 		"Workspace 2",
 		user.Token,
 		router,
 	)
+	defer workspaces_testing.RemoveTestWorkspace(workspace2, router)
 
 	var response workspaces_dto.ListWorkspacesResponseDTO
 	test_utils.MakeGetRequestAndUnmarshal(
@@ -254,6 +265,7 @@ func Test_GetSingleWorkspace_PermissionsEnforced(t *testing.T) {
 				owner.Token,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -263,7 +275,13 @@ func Test_GetSingleWorkspace_PermissionsEnforced(t *testing.T) {
 				testUserToken = owner.Token
 			} else if tt.workspaceRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			} else {
 				nonMember := users_testing.CreateTestUser(users_enums.UserRoleMember)
@@ -359,13 +377,20 @@ func Test_UpdateWorkspace_PermissionsEnforced(t *testing.T) {
 				owner.Token,
 				router,
 			)
+			defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 			var testUserToken string
 			if tt.workspaceRole == users_enums.WorkspaceRoleOwner {
 				testUserToken = owner.Token
 			} else {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			}
 
@@ -396,7 +421,11 @@ func Test_UpdateWorkspace_PermissionsEnforced(t *testing.T) {
 					updateRequest,
 					tt.expectedStatusCode,
 				)
-				assert.Contains(t, string(resp.Body), "insufficient permissions to update workspace")
+				assert.Contains(
+					t,
+					string(resp.Body),
+					"insufficient permissions to update workspace",
+				)
 			}
 		})
 	}
@@ -452,6 +481,10 @@ func Test_DeleteWorkspace_PermissionsEnforced(t *testing.T) {
 				owner.Token,
 				router,
 			)
+			// Only cleanup if the test doesn't successfully delete the workspace
+			if !tt.expectSuccess {
+				defer workspaces_testing.RemoveTestWorkspace(workspace, router)
+			}
 
 			var testUserToken string
 			if tt.isGlobalAdmin {
@@ -461,7 +494,13 @@ func Test_DeleteWorkspace_PermissionsEnforced(t *testing.T) {
 				testUserToken = owner.Token
 			} else if tt.workspaceRole != nil {
 				member := users_testing.CreateTestUser(users_enums.UserRoleMember)
-				workspaces_testing.AddMemberToWorkspace(workspace, member, *tt.workspaceRole, owner.Token, router)
+				workspaces_testing.AddMemberToWorkspace(
+					workspace,
+					member,
+					*tt.workspaceRole,
+					owner.Token,
+					router,
+				)
 				testUserToken = member.Token
 			}
 
@@ -475,7 +514,11 @@ func Test_DeleteWorkspace_PermissionsEnforced(t *testing.T) {
 			if tt.expectSuccess {
 				assert.Contains(t, string(resp.Body), "Workspace deleted successfully")
 			} else {
-				assert.Contains(t, string(resp.Body), "only workspace owner or admin can delete workspace")
+				assert.Contains(
+					t,
+					string(resp.Body),
+					"only workspace owner or admin can delete workspace",
+				)
 			}
 		})
 	}
@@ -496,6 +539,7 @@ func Test_GetWorkspaceAuditLogs_WhenUserIsWorkspaceAdmin_ReturnsAuditLogs(t *tes
 		owner.Token,
 		router,
 	)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	workspaces_testing.AddMemberToWorkspace(
 		workspace,
@@ -535,11 +579,14 @@ func Test_GetWorkspaceAuditLogs_WithMultipleWorkspaces_ReturnsOnlyWorkspaceSpeci
 		owner1.Token,
 		router,
 	)
+	defer workspaces_testing.RemoveTestWorkspace(workspace1, router)
+
 	workspace2, _ := workspaces_testing.CreateTestWorkspaceWithToken(
 		workspaceName2,
 		owner2.Token,
 		router,
 	)
+	defer workspaces_testing.RemoveTestWorkspace(workspace2, router)
 
 	updateWorkspace1 := workspaces_models.Workspace{
 		Name: "Updated " + workspace1.Name,
@@ -626,6 +673,7 @@ func Test_GetWorkspaceAuditLogs_WithDifferentUserRoles_EnforcesPermissionsCorrec
 		owner.Token,
 		router,
 	)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	workspaces_testing.AddMemberToWorkspace(
 		workspace,
@@ -673,6 +721,7 @@ func Test_GetWorkspaceAuditLogs_WithoutAuthToken_ReturnsUnauthorized(t *testing.
 		owner.Token,
 		router,
 	)
+	defer workspaces_testing.RemoveTestWorkspace(workspace, router)
 
 	test_utils.MakeGetRequest(t, router,
 		"/api/v1/workspaces/"+workspace.ID.String()+"/audit-logs",

@@ -2,11 +2,16 @@ package databases
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
+	"databasus-backend/internal/config"
 	audit_logs "databasus-backend/internal/features/audit_logs"
 	"databasus-backend/internal/features/databases/databases/mariadb"
 	"databasus-backend/internal/features/databases/databases/mongodb"
@@ -16,8 +21,6 @@ import (
 	users_models "databasus-backend/internal/features/users/models"
 	workspaces_services "databasus-backend/internal/features/workspaces/services"
 	"databasus-backend/internal/util/encryption"
-
-	"github.com/google/uuid"
 )
 
 type DatabaseService struct {
@@ -52,6 +55,17 @@ func (s *DatabaseService) AddDbCopyListener(
 	s.dbCopyListener = append(s.dbCopyListener, dbCopyListener)
 }
 
+func (s *DatabaseService) GetNotifierAttachedDatabasesIDs(
+	notifierID uuid.UUID,
+) ([]uuid.UUID, error) {
+	databasesIDs, err := s.dbRepository.GetDatabasesIDsByNotifierID(notifierID)
+	if err != nil {
+		return nil, err
+	}
+
+	return databasesIDs, nil
+}
+
 func (s *DatabaseService) CreateDatabase(
 	user *users_models.User,
 	workspaceID uuid.UUID,
@@ -71,8 +85,12 @@ func (s *DatabaseService) CreateDatabase(
 		return nil, err
 	}
 
-	if err := database.PopulateVersionIfEmpty(s.logger, s.fieldEncryptor); err != nil {
-		return nil, fmt.Errorf("failed to auto-detect database version: %w", err)
+	if err := database.PopulateDbData(s.logger, s.fieldEncryptor); err != nil {
+		return nil, fmt.Errorf("failed to auto-detect database data: %w", err)
+	}
+
+	if err := s.verifyReadOnlyUserIfNeeded(database); err != nil {
+		return nil, err
 	}
 
 	if err := database.EncryptSensitiveFields(s.fieldEncryptor); err != nil {
@@ -126,15 +144,27 @@ func (s *DatabaseService) UpdateDatabase(
 		return err
 	}
 
+	for _, notifier := range database.Notifiers {
+		if notifier.WorkspaceID != *existingDatabase.WorkspaceID {
+			return errors.New("notifier does not belong to this workspace")
+		}
+	}
+
 	existingDatabase.Update(database)
 
 	if err := existingDatabase.Validate(); err != nil {
 		return err
 	}
 
-	if err := existingDatabase.PopulateVersionIfEmpty(s.logger, s.fieldEncryptor); err != nil {
-		return fmt.Errorf("failed to auto-detect database version: %w", err)
+	if err := existingDatabase.PopulateDbData(s.logger, s.fieldEncryptor); err != nil {
+		return fmt.Errorf("failed to auto-detect database data: %w", err)
 	}
+
+	if err := s.verifyReadOnlyUserIfNeeded(existingDatabase); err != nil {
+		return err
+	}
+
+	oldName := existingDatabase.Name
 
 	if err := existingDatabase.EncryptSensitiveFields(s.fieldEncryptor); err != nil {
 		return fmt.Errorf("failed to encrypt sensitive fields: %w", err)
@@ -145,11 +175,23 @@ func (s *DatabaseService) UpdateDatabase(
 		return err
 	}
 
-	s.auditLogService.WriteAuditLog(
-		fmt.Sprintf("Database updated: %s", existingDatabase.Name),
-		&user.ID,
-		existingDatabase.WorkspaceID,
-	)
+	if oldName != existingDatabase.Name {
+		s.auditLogService.WriteAuditLog(
+			fmt.Sprintf(
+				"Database updated and renamed from '%s' to '%s'",
+				oldName,
+				existingDatabase.Name,
+			),
+			&user.ID,
+			existingDatabase.WorkspaceID,
+		)
+	} else {
+		s.auditLogService.WriteAuditLog(
+			fmt.Sprintf("Database updated: %s", existingDatabase.Name),
+			&user.ID,
+			existingDatabase.WorkspaceID,
+		)
+	}
 
 	return nil
 }
@@ -249,6 +291,23 @@ func (s *DatabaseService) IsNotifierUsing(
 	}
 
 	return s.dbRepository.IsNotifierUsing(notifierID)
+}
+
+func (s *DatabaseService) CountDatabasesByNotifier(
+	user *users_models.User,
+	notifierID uuid.UUID,
+) (int, error) {
+	_, err := s.notifierService.GetNotifier(user, notifierID)
+	if err != nil {
+		return 0, err
+	}
+
+	databaseIDs, err := s.dbRepository.GetDatabasesIDsByNotifierID(notifierID)
+	if err != nil {
+		return 0, err
+	}
+
+	return len(databaseIDs), nil
 }
 
 func (s *DatabaseService) TestDatabaseConnection(
@@ -398,6 +457,7 @@ func (s *DatabaseService) CopyDatabase(
 			newDatabase.Postgresql = &postgresql.PostgresqlDatabase{
 				ID:             uuid.Nil,
 				DatabaseID:     nil,
+				BackupType:     existingDatabase.Postgresql.BackupType,
 				Version:        existingDatabase.Postgresql.Version,
 				Host:           existingDatabase.Postgresql.Host,
 				Port:           existingDatabase.Postgresql.Port,
@@ -481,6 +541,58 @@ func (s *DatabaseService) CopyDatabase(
 	return copiedDatabase, nil
 }
 
+func (s *DatabaseService) TransferDatabaseToWorkspace(
+	databaseID uuid.UUID,
+	targetWorkspaceID uuid.UUID,
+) error {
+	database, err := s.dbRepository.FindByID(databaseID)
+	if err != nil {
+		return err
+	}
+
+	sourceWorkspaceID := database.WorkspaceID
+	database.WorkspaceID = &targetWorkspaceID
+
+	_, err = s.dbRepository.Save(database)
+	if err != nil {
+		return err
+	}
+
+	sourceWorkspace, err := s.workspaceService.GetWorkspaceByID(*sourceWorkspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to get source workspace: %w", err)
+	}
+
+	targetWorkspace, err := s.workspaceService.GetWorkspaceByID(targetWorkspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to get target workspace: %w", err)
+	}
+
+	s.auditLogService.WriteAuditLog(
+		fmt.Sprintf("Database transferred: %s from workspace '%s' to workspace '%s'",
+			database.Name, sourceWorkspace.Name, targetWorkspace.Name),
+		nil,
+		&targetWorkspaceID,
+	)
+
+	return nil
+}
+
+func (s *DatabaseService) UpdateDatabaseNotifiers(
+	databaseID uuid.UUID,
+	newNotifiers []notifiers.Notifier,
+) error {
+	database, err := s.dbRepository.FindByID(databaseID)
+	if err != nil {
+		return err
+	}
+
+	database.Notifiers = newNotifiers
+
+	_, err = s.dbRepository.Save(database)
+	return err
+}
+
 func (s *DatabaseService) SetHealthStatus(
 	databaseID uuid.UUID,
 	healthStatus *HealthStatus,
@@ -497,6 +609,71 @@ func (s *DatabaseService) SetHealthStatus(
 	}
 
 	return nil
+}
+
+func (s *DatabaseService) RegenerateAgentToken(
+	user *users_models.User,
+	databaseID uuid.UUID,
+) (string, error) {
+	database, err := s.dbRepository.FindByID(databaseID)
+	if err != nil {
+		return "", err
+	}
+
+	if database.WorkspaceID == nil {
+		return "", errors.New("cannot regenerate token for database without workspace")
+	}
+
+	canManage, err := s.workspaceService.CanUserManageDBs(*database.WorkspaceID, user)
+	if err != nil {
+		return "", err
+	}
+	if !canManage {
+		return "", errors.New(
+			"insufficient permissions to regenerate agent token for this database",
+		)
+	}
+
+	plainToken := strings.ReplaceAll(uuid.New().String(), "-", "")
+	tokenHash := hashAgentToken(plainToken)
+
+	database.AgentToken = &tokenHash
+	database.IsAgentTokenGenerated = true
+
+	_, err = s.dbRepository.Save(database)
+	if err != nil {
+		return "", err
+	}
+
+	s.auditLogService.WriteAuditLog(
+		fmt.Sprintf("Agent token regenerated for database: %s", database.Name),
+		&user.ID,
+		database.WorkspaceID,
+	)
+
+	return plainToken, nil
+}
+
+func (s *DatabaseService) VerifyAgentToken(token string) error {
+	hash := hashAgentToken(token)
+
+	_, err := s.dbRepository.FindByAgentTokenHash(hash)
+	if err != nil {
+		return errors.New("invalid token")
+	}
+
+	return nil
+}
+
+func (s *DatabaseService) GetDatabaseByAgentToken(token string) (*Database, error) {
+	hash := hashAgentToken(token)
+
+	partial, err := s.dbRepository.FindByAgentTokenHash(hash)
+	if err != nil {
+		return nil, errors.New("invalid agent token")
+	}
+
+	return s.dbRepository.FindByID(partial.ID)
 }
 
 func (s *DatabaseService) OnBeforeWorkspaceDeletion(workspaceID uuid.UUID) error {
@@ -518,17 +695,17 @@ func (s *DatabaseService) OnBeforeWorkspaceDeletion(workspaceID uuid.UUID) error
 func (s *DatabaseService) IsUserReadOnly(
 	user *users_models.User,
 	database *Database,
-) (bool, error) {
+) (bool, []string, error) {
 	var usingDatabase *Database
 
 	if database.ID != uuid.Nil {
 		existingDatabase, err := s.dbRepository.FindByID(database.ID)
 		if err != nil {
-			return false, err
+			return false, nil, err
 		}
 
 		if existingDatabase.WorkspaceID == nil {
-			return false, errors.New("cannot check user for database without workspace")
+			return false, nil, errors.New("cannot check user for database without workspace")
 		}
 
 		canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(
@@ -536,31 +713,34 @@ func (s *DatabaseService) IsUserReadOnly(
 			user,
 		)
 		if err != nil {
-			return false, err
+			return false, nil, err
 		}
 		if !canAccess {
-			return false, errors.New("insufficient permissions to access this database")
+			return false, nil, errors.New("insufficient permissions to access this database")
 		}
 
 		if database.WorkspaceID != nil && *existingDatabase.WorkspaceID != *database.WorkspaceID {
-			return false, errors.New("database does not belong to this workspace")
+			return false, nil, errors.New("database does not belong to this workspace")
 		}
 
 		existingDatabase.Update(database)
 
 		if err := existingDatabase.Validate(); err != nil {
-			return false, err
+			return false, nil, err
 		}
 
 		usingDatabase = existingDatabase
 	} else {
 		if database.WorkspaceID != nil {
-			canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(*database.WorkspaceID, user)
+			canAccess, _, err := s.workspaceService.CanUserAccessWorkspace(
+				*database.WorkspaceID,
+				user,
+			)
 			if err != nil {
-				return false, err
+				return false, nil, err
 			}
 			if !canAccess {
-				return false, errors.New("insufficient permissions to access this workspace")
+				return false, nil, errors.New("insufficient permissions to access this workspace")
 			}
 		}
 
@@ -570,38 +750,7 @@ func (s *DatabaseService) IsUserReadOnly(
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	switch usingDatabase.Type {
-	case DatabaseTypePostgres:
-		return usingDatabase.Postgresql.IsUserReadOnly(
-			ctx,
-			s.logger,
-			s.fieldEncryptor,
-			usingDatabase.ID,
-		)
-	case DatabaseTypeMysql:
-		return usingDatabase.Mysql.IsUserReadOnly(
-			ctx,
-			s.logger,
-			s.fieldEncryptor,
-			usingDatabase.ID,
-		)
-	case DatabaseTypeMariadb:
-		return usingDatabase.Mariadb.IsUserReadOnly(
-			ctx,
-			s.logger,
-			s.fieldEncryptor,
-			usingDatabase.ID,
-		)
-	case DatabaseTypeMongodb:
-		return usingDatabase.Mongodb.IsUserReadOnly(
-			ctx,
-			s.logger,
-			s.fieldEncryptor,
-			usingDatabase.ID,
-		)
-	default:
-		return false, errors.New("read-only check not supported for this database type")
-	}
+	return usingDatabase.IsUserReadOnly(ctx, s.logger, s.fieldEncryptor)
 }
 
 func (s *DatabaseService) CreateReadOnlyUser(
@@ -697,4 +846,37 @@ func (s *DatabaseService) CreateReadOnlyUser(
 	}
 
 	return username, password, nil
+}
+
+func (s *DatabaseService) verifyReadOnlyUserIfNeeded(database *Database) error {
+	if !config.GetEnv().IsCloud {
+		return nil
+	}
+
+	if database.Postgresql != nil &&
+		database.Postgresql.BackupType == postgresql.PostgresBackupTypeWalV1 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	isReadOnly, permissions, err := database.IsUserReadOnly(ctx, s.logger, s.fieldEncryptor)
+	if err != nil {
+		return fmt.Errorf("failed to verify user permissions: %w", err)
+	}
+
+	if !isReadOnly {
+		return fmt.Errorf(
+			"in cloud mode, only read-only database users are allowed (user has permissions: %v)",
+			permissions,
+		)
+	}
+
+	return nil
+}
+
+func hashAgentToken(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", hash)
 }

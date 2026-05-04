@@ -1,12 +1,20 @@
-postgresus_data/
-postgresus-data/
+ansible/
 databasus-data/
 .env
 pgdata/
+mysqldata/
+mariadbdata/
+valkey-data/
+victoria-logs-data/
+wal-queue/
+temp/
 docker-compose.yml
+!agent/e2e/docker-compose.yml
 node_modules/
 .idea
 /articles
 
 .DS_Store
 /scripts
+.vscode/settings.json
+.claude

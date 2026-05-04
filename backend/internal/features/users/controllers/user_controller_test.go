@@ -7,15 +7,15 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"golang.org/x/oauth2"
+
 	users_dto "databasus-backend/internal/features/users/dto"
 	users_enums "databasus-backend/internal/features/users/enums"
 	users_services "databasus-backend/internal/features/users/services"
 	users_testing "databasus-backend/internal/features/users/testing"
 	test_utils "databasus-backend/internal/util/testing"
-
-	"github.com/google/uuid"
-	"github.com/stretchr/testify/assert"
-	"golang.org/x/oauth2"
 )
 
 func Test_SignUpUser_WithValidData_UserCreated(t *testing.T) {
@@ -27,7 +27,20 @@ func Test_SignUpUser_WithValidData_UserCreated(t *testing.T) {
 		Name:     "Test User",
 	}
 
-	test_utils.MakePostRequest(t, router, "/api/v1/users/signup", "", request, http.StatusOK)
+	var response users_dto.SignInResponseDTO
+	test_utils.MakePostRequestAndUnmarshal(
+		t,
+		router,
+		"/api/v1/users/signup",
+		"",
+		request,
+		http.StatusOK,
+		&response,
+	)
+
+	assert.NotEmpty(t, response.Token)
+	assert.NotEqual(t, uuid.Nil, response.UserID)
+	assert.Equal(t, request.Email, response.Email)
 }
 
 func Test_SignUpUser_WithInvalidJSON_ReturnsBadRequest(t *testing.T) {
@@ -1145,4 +1158,49 @@ func Test_GoogleOAuth_WithInvitedUser_ActivatesUser(t *testing.T) {
 	assert.NotEmpty(t, response.Token)
 	assert.Equal(t, email, response.Email)
 	assert.False(t, response.IsNewUser)
+}
+
+func Test_SignIn_WithExcessiveAttempts_RateLimitEnforced(t *testing.T) {
+	router := createUserTestRouter()
+	email := "ratelimit" + uuid.New().String() + "@example.com"
+	password := "testpassword123"
+
+	// Create a user first
+	signupRequest := users_dto.SignUpRequestDTO{
+		Email:    email,
+		Password: password,
+		Name:     "Rate Limit Test User",
+	}
+	test_utils.MakePostRequest(t, router, "/api/v1/users/signup", "", signupRequest, http.StatusOK)
+
+	// Make 10 sign-in attempts (should succeed)
+	for range 10 {
+		signinRequest := users_dto.SignInRequestDTO{
+			Email:    email,
+			Password: password,
+		}
+		test_utils.MakePostRequest(
+			t,
+			router,
+			"/api/v1/users/signin",
+			"",
+			signinRequest,
+			http.StatusOK,
+		)
+	}
+
+	// 11th attempt should be rate limited
+	signinRequest := users_dto.SignInRequestDTO{
+		Email:    email,
+		Password: password,
+	}
+	resp := test_utils.MakePostRequest(
+		t,
+		router,
+		"/api/v1/users/signin",
+		"",
+		signinRequest,
+		http.StatusTooManyRequests,
+	)
+	assert.Contains(t, string(resp.Body), "Rate limit exceeded")
 }

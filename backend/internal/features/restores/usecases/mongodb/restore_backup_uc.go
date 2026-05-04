@@ -13,19 +13,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"databasus-backend/internal/config"
-	"databasus-backend/internal/features/backups/backups"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	"databasus-backend/internal/features/backups/backups/encryption"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
 	mongodbtypes "databasus-backend/internal/features/databases/databases/mongodb"
 	encryption_secrets "databasus-backend/internal/features/encryption/secrets"
-	"databasus-backend/internal/features/restores/models"
+	restores_core "databasus-backend/internal/features/restores/core"
 	"databasus-backend/internal/features/storages"
 	util_encryption "databasus-backend/internal/util/encryption"
-	files_utils "databasus-backend/internal/util/files"
 	"databasus-backend/internal/util/tools"
 )
 
@@ -39,11 +36,12 @@ type RestoreMongodbBackupUsecase struct {
 }
 
 func (uc *RestoreMongodbBackupUsecase) Execute(
+	parentCtx context.Context,
 	originalDB *databases.Database,
 	restoringToDB *databases.Database,
 	backupConfig *backups_config.BackupConfig,
-	restore models.Restore,
-	backup *backups.Backup,
+	restore restores_core.Restore,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 ) error {
 	if originalDB.Type != databases.DatabaseTypeMongodb {
@@ -79,11 +77,8 @@ func (uc *RestoreMongodbBackupUsecase) Execute(
 	args := uc.buildMongorestoreArgs(mdb, decryptedPassword, sourceDatabase)
 
 	return uc.restoreFromStorage(
-		tools.GetMongodbExecutable(
-			tools.MongodbExecutableMongorestore,
-			config.GetEnv().EnvMode,
-			config.GetEnv().MongodbInstallDir,
-		),
+		parentCtx,
+		tools.GetMongodbExecutable(tools.MongodbExecutableMongorestore),
 		args,
 		backup,
 		storage,
@@ -125,12 +120,13 @@ func (uc *RestoreMongodbBackupUsecase) buildMongorestoreArgs(
 }
 
 func (uc *RestoreMongodbBackupUsecase) restoreFromStorage(
+	parentCtx context.Context,
 	mongorestoreBin string,
 	args []string,
-	backup *backups.Backup,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), restoreTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, restoreTimeout)
 	defer cancel()
 
 	go func() {
@@ -139,6 +135,9 @@ func (uc *RestoreMongodbBackupUsecase) restoreFromStorage(
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-parentCtx.Done():
+				cancel()
 				return
 			case <-ticker.C:
 				if config.IsShouldShutdown() {
@@ -149,21 +148,27 @@ func (uc *RestoreMongodbBackupUsecase) restoreFromStorage(
 		}
 	}()
 
-	tempBackupFile, cleanupFunc, err := uc.downloadBackupToTempFile(ctx, backup, storage)
+	// Stream backup directly from storage
+	fieldEncryptor := util_encryption.GetFieldEncryptor()
+	rawReader, err := storage.GetFile(fieldEncryptor, backup.FileName)
 	if err != nil {
-		return fmt.Errorf("failed to download backup: %w", err)
+		return fmt.Errorf("failed to get backup file from storage: %w", err)
 	}
-	defer cleanupFunc()
+	defer func() {
+		if err := rawReader.Close(); err != nil {
+			uc.logger.Error("Failed to close backup reader", "error", err)
+		}
+	}()
 
-	return uc.executeMongoRestore(ctx, mongorestoreBin, args, tempBackupFile, backup)
+	return uc.executeMongoRestore(ctx, mongorestoreBin, args, rawReader, backup)
 }
 
 func (uc *RestoreMongodbBackupUsecase) executeMongoRestore(
 	ctx context.Context,
 	mongorestoreBin string,
 	args []string,
-	backupFile string,
-	backup *backups.Backup,
+	backupReader io.ReadCloser,
+	backup *backups_core.Backup,
 ) error {
 	cmd := exec.CommandContext(ctx, mongorestoreBin, args...)
 
@@ -183,16 +188,10 @@ func (uc *RestoreMongodbBackupUsecase) executeMongoRestore(
 		safeArgs,
 	)
 
-	backupFileHandle, err := os.Open(backupFile)
-	if err != nil {
-		return fmt.Errorf("failed to open backup file: %w", err)
-	}
-	defer func() { _ = backupFileHandle.Close() }()
-
-	var inputReader io.Reader = backupFileHandle
+	var inputReader io.Reader = backupReader
 
 	if backup.Encryption == backups_config.BackupEncryptionEncrypted {
-		decryptReader, err := uc.setupDecryption(backupFileHandle, backup)
+		decryptReader, err := uc.setupDecryption(backupReader, backup)
 		if err != nil {
 			return fmt.Errorf("failed to setup decryption: %w", err)
 		}
@@ -221,6 +220,15 @@ func (uc *RestoreMongodbBackupUsecase) executeMongoRestore(
 	waitErr := cmd.Wait()
 	stderrOutput := <-stderrCh
 
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return fmt.Errorf("restore cancelled")
+		}
+	default:
+	}
+
 	if config.IsShouldShutdown() {
 		return fmt.Errorf("restore cancelled due to shutdown")
 	}
@@ -232,72 +240,9 @@ func (uc *RestoreMongodbBackupUsecase) executeMongoRestore(
 	return nil
 }
 
-func (uc *RestoreMongodbBackupUsecase) downloadBackupToTempFile(
-	ctx context.Context,
-	backup *backups.Backup,
-	storage *storages.Storage,
-) (string, func(), error) {
-	err := files_utils.EnsureDirectories([]string{
-		config.GetEnv().TempFolder,
-	})
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to ensure directories: %w", err)
-	}
-
-	tempDir, err := os.MkdirTemp(config.GetEnv().TempFolder, "restore_"+uuid.New().String())
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to create temporary directory: %w", err)
-	}
-
-	cleanupFunc := func() {
-		_ = os.RemoveAll(tempDir)
-	}
-
-	tempBackupFile := filepath.Join(tempDir, "backup.archive.gz")
-
-	uc.logger.Info(
-		"Downloading backup file from storage to temporary file",
-		"backupId", backup.ID,
-		"tempFile", tempBackupFile,
-		"encrypted", backup.Encryption == backups_config.BackupEncryptionEncrypted,
-	)
-
-	fieldEncryptor := util_encryption.GetFieldEncryptor()
-	rawReader, err := storage.GetFile(fieldEncryptor, backup.ID)
-	if err != nil {
-		cleanupFunc()
-		return "", nil, fmt.Errorf("failed to get backup file from storage: %w", err)
-	}
-	defer func() {
-		if err := rawReader.Close(); err != nil {
-			uc.logger.Error("Failed to close backup reader", "error", err)
-		}
-	}()
-
-	tempFile, err := os.Create(tempBackupFile)
-	if err != nil {
-		cleanupFunc()
-		return "", nil, fmt.Errorf("failed to create temporary backup file: %w", err)
-	}
-	defer func() {
-		if err := tempFile.Close(); err != nil {
-			uc.logger.Error("Failed to close temporary file", "error", err)
-		}
-	}()
-
-	_, err = uc.copyWithShutdownCheck(ctx, tempFile, rawReader)
-	if err != nil {
-		cleanupFunc()
-		return "", nil, fmt.Errorf("failed to write backup to temporary file: %w", err)
-	}
-
-	uc.logger.Info("Backup file written to temporary location", "tempFile", tempBackupFile)
-	return tempBackupFile, cleanupFunc, nil
-}
-
 func (uc *RestoreMongodbBackupUsecase) setupDecryption(
 	reader io.Reader,
-	backup *backups.Backup,
+	backup *backups_core.Backup,
 ) (io.Reader, error) {
 	if backup.EncryptionSalt == nil || backup.EncryptionIV == nil {
 		return nil, errors.New("encrypted backup missing salt or IV")
@@ -330,57 +275,6 @@ func (uc *RestoreMongodbBackupUsecase) setupDecryption(
 	}
 
 	return decryptReader, nil
-}
-
-func (uc *RestoreMongodbBackupUsecase) copyWithShutdownCheck(
-	ctx context.Context,
-	dst io.Writer,
-	src io.Reader,
-) (int64, error) {
-	buf := make([]byte, 16*1024*1024)
-	var totalBytesWritten int64
-
-	for {
-		select {
-		case <-ctx.Done():
-			return totalBytesWritten, fmt.Errorf("copy cancelled: %w", ctx.Err())
-		default:
-		}
-
-		if config.IsShouldShutdown() {
-			return totalBytesWritten, fmt.Errorf("copy cancelled due to shutdown")
-		}
-
-		bytesRead, readErr := src.Read(buf)
-		if bytesRead > 0 {
-			bytesWritten, writeErr := dst.Write(buf[0:bytesRead])
-			if bytesWritten < 0 || bytesRead < bytesWritten {
-				bytesWritten = 0
-				if writeErr == nil {
-					writeErr = fmt.Errorf("invalid write result")
-				}
-			}
-
-			if writeErr != nil {
-				return totalBytesWritten, writeErr
-			}
-
-			if bytesRead != bytesWritten {
-				return totalBytesWritten, io.ErrShortWrite
-			}
-
-			totalBytesWritten += int64(bytesWritten)
-		}
-
-		if readErr != nil {
-			if readErr != io.EOF {
-				return totalBytesWritten, readErr
-			}
-			break
-		}
-	}
-
-	return totalBytesWritten, nil
 }
 
 func (uc *RestoreMongodbBackupUsecase) handleMongoRestoreError(

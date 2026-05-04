@@ -1,12 +1,13 @@
 package usecases
 
 import (
+	"context"
 	"errors"
 
-	"databasus-backend/internal/features/backups/backups"
+	backups_core "databasus-backend/internal/features/backups/backups/core"
 	backups_config "databasus-backend/internal/features/backups/config"
 	"databasus-backend/internal/features/databases"
-	"databasus-backend/internal/features/restores/models"
+	restores_core "databasus-backend/internal/features/restores/core"
 	usecases_mariadb "databasus-backend/internal/features/restores/usecases/mariadb"
 	usecases_mongodb "databasus-backend/internal/features/restores/usecases/mongodb"
 	usecases_mysql "databasus-backend/internal/features/restores/usecases/mysql"
@@ -22,17 +23,19 @@ type RestoreBackupUsecase struct {
 }
 
 func (uc *RestoreBackupUsecase) Execute(
+	ctx context.Context,
 	backupConfig *backups_config.BackupConfig,
-	restore models.Restore,
+	restore restores_core.Restore,
 	originalDB *databases.Database,
 	restoringToDB *databases.Database,
-	backup *backups.Backup,
+	backup *backups_core.Backup,
 	storage *storages.Storage,
 	isExcludeExtensions bool,
 ) error {
 	switch originalDB.Type {
 	case databases.DatabaseTypePostgres:
 		return uc.restorePostgresqlBackupUsecase.Execute(
+			ctx,
 			originalDB,
 			restoringToDB,
 			backupConfig,
@@ -43,6 +46,7 @@ func (uc *RestoreBackupUsecase) Execute(
 		)
 	case databases.DatabaseTypeMysql:
 		return uc.restoreMysqlBackupUsecase.Execute(
+			ctx,
 			originalDB,
 			restoringToDB,
 			backupConfig,
@@ -52,6 +56,7 @@ func (uc *RestoreBackupUsecase) Execute(
 		)
 	case databases.DatabaseTypeMariadb:
 		return uc.restoreMariadbBackupUsecase.Execute(
+			ctx,
 			originalDB,
 			restoringToDB,
 			backupConfig,
@@ -61,6 +66,7 @@ func (uc *RestoreBackupUsecase) Execute(
 		)
 	case databases.DatabaseTypeMongodb:
 		return uc.restoreMongodbBackupUsecase.Execute(
+			ctx,
 			originalDB,
 			restoringToDB,
 			backupConfig,

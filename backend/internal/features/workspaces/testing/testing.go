@@ -2,10 +2,14 @@ package workspaces_testing
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"databasus-backend/internal/features/audit_logs"
 	users_dto "databasus-backend/internal/features/users/dto"
@@ -16,9 +20,6 @@ import (
 	workspaces_dto "databasus-backend/internal/features/workspaces/dto"
 	workspaces_models "databasus-backend/internal/features/workspaces/models"
 	workspaces_repositories "databasus-backend/internal/features/workspaces/repositories"
-
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 func CreateTestRouter(controllers ...ControllerInterface) *gin.Engine {
@@ -375,7 +376,13 @@ func RemoveTestWorkspace(workspace *workspaces_models.Workspace, router *gin.Eng
 	membershipRepo := &workspaces_repositories.MembershipRepository{}
 	workspaceMembers, err := membershipRepo.GetWorkspaceMembers(workspace.ID)
 	if err != nil {
-		panic("Failed to get workspace members: " + err.Error())
+		// Workspace might already be deleted or doesn't exist, silently return
+		return
+	}
+
+	if len(workspaceMembers) == 0 {
+		// No members found, workspace might have been deleted, silently return
+		return
 	}
 
 	var ownerToken string
@@ -385,12 +392,16 @@ func RemoveTestWorkspace(workspace *workspaces_models.Workspace, router *gin.Eng
 
 			owner, err := userService.GetUserByID(m.UserID)
 			if err != nil {
-				panic("Failed to get owner user: " + err.Error())
+				// Owner user not found, workspace might be in inconsistent state, try direct deletion
+				_ = RemoveTestWorkspaceDirect(workspace.ID)
+				return
 			}
 
 			tokenResponse, err := userService.GenerateAccessToken(owner)
 			if err != nil {
-				panic("Failed to generate owner token: " + err.Error())
+				// Cannot generate token, try direct deletion
+				_ = RemoveTestWorkspaceDirect(workspace.ID)
+				return
 			}
 
 			ownerToken = tokenResponse.Token
@@ -399,7 +410,9 @@ func RemoveTestWorkspace(workspace *workspaces_models.Workspace, router *gin.Eng
 	}
 
 	if ownerToken == "" {
-		panic("No workspace owner found")
+		// No owner found, try direct deletion
+		_ = RemoveTestWorkspaceDirect(workspace.ID)
+		return
 	}
 
 	DeleteWorkspace(workspace, ownerToken, router)
@@ -421,7 +434,7 @@ func MakeAPIRequest(
 		requestBody = bytes.NewBuffer(nil)
 	}
 
-	req, err := http.NewRequest(method, url, requestBody)
+	req, err := http.NewRequestWithContext(context.Background(), method, url, requestBody)
 	if err != nil {
 		panic(err)
 	}

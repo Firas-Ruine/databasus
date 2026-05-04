@@ -1,4 +1,4 @@
-import { InfoCircleOutlined } from '@ant-design/icons';
+import { DownOutlined, InfoCircleOutlined, UpOutlined } from '@ant-design/icons';
 import {
   Button,
   Checkbox,
@@ -15,12 +15,19 @@ import { CronExpressionParser } from 'cron-parser';
 import dayjs, { Dayjs } from 'dayjs';
 import { useEffect, useMemo, useState } from 'react';
 
-import { type BackupConfig, BackupEncryption, backupConfigApi } from '../../../entity/backups';
+import { IS_CLOUD } from '../../../constants';
+import {
+  type BackupConfig,
+  BackupEncryption,
+  RetentionPolicyType,
+  backupConfigApi,
+} from '../../../entity/backups';
 import { BackupNotificationType } from '../../../entity/backups/model/BackupNotificationType';
 import type { Database } from '../../../entity/databases';
 import { Period } from '../../../entity/databases/model/Period';
 import { type Interval, IntervalType } from '../../../entity/intervals';
 import { type Storage, getStorageLogoFromType, storageApi } from '../../../entity/storages';
+import type { UserProfile } from '../../../entity/users';
 import { getUserTimeFormat } from '../../../shared/time';
 import {
   getUserTimeFormat as getIs12Hour,
@@ -33,6 +40,7 @@ import { ConfirmationComponent } from '../../../shared/ui';
 import { EditStorageComponent } from '../../storages/ui/edit/EditStorageComponent';
 
 interface Props {
+  user: UserProfile;
   database: Database;
 
   isShowBackButton: boolean;
@@ -56,7 +64,17 @@ const weekdayOptions = [
   { value: 7, label: 'Sun' },
 ];
 
+const retentionPolicyOptions = [
+  {
+    label: 'GFS (keep last N hourly, daily, weekly, monthly and yearly backups)',
+    value: RetentionPolicyType.GFS,
+  },
+  { label: 'Time period (last N days)', value: RetentionPolicyType.TimePeriod },
+  { label: 'Count (N last backups)', value: RetentionPolicyType.Count },
+];
+
 export const EditBackupConfigComponent = ({
+  user,
   database,
 
   isShowBackButton,
@@ -73,11 +91,16 @@ export const EditBackupConfigComponent = ({
   const [isSaving, setIsSaving] = useState(false);
 
   const [storages, setStorages] = useState<Storage[]>([]);
-  const [isStoragesLoading, setIsStoragesLoading] = useState(false);
   const [isShowCreateStorage, setShowCreateStorage] = useState(false);
   const [storageSelectKey, setStorageSelectKey] = useState(0);
 
   const [isShowWarn, setIsShowWarn] = useState(false);
+
+  const [isLoading, setIsLoading] = useState(true);
+
+  const hasAdvancedValues = !!backupConfig?.isRetryIfFailed;
+  const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
+  const [isShowGfsHint, setShowGfsHint] = useState(false);
 
   const timeFormat = useMemo(() => {
     const is12 = getIs12Hour();
@@ -125,54 +148,78 @@ export const EditBackupConfigComponent = ({
   };
 
   const loadStorages = async () => {
-    setIsStoragesLoading(true);
-
     try {
       const storages = await storageApi.getStorages(database.workspaceId);
       setStorages(storages);
+
+      if (IS_CLOUD) {
+        const systemStorages = storages.filter((s) => s.isSystem);
+        if (systemStorages.length > 0) {
+          updateBackupConfig({ storage: systemStorages[0] });
+        }
+      }
     } catch (e) {
       alert((e as Error).message);
     }
-
-    setIsStoragesLoading(false);
   };
 
   useEffect(() => {
-    if (database.id) {
-      backupConfigApi.getBackupConfigByDbID(database.id).then((res) => {
-        setBackupConfig(res);
-        setIsUnsaved(false);
-        setIsSaving(false);
-      });
-    } else {
-      setBackupConfig({
-        databaseId: database.id,
-        isBackupsEnabled: true,
-        backupInterval: {
-          id: undefined as unknown as string,
-          interval: IntervalType.DAILY,
-          timeOfDay: '00:00',
-        },
-        storage: undefined,
-        storePeriod: Period.THREE_MONTH,
-        sendNotificationsOn: [],
-        isRetryIfFailed: true,
-        maxFailedTriesCount: 3,
-        encryption: BackupEncryption.ENCRYPTED,
-      });
-    }
-    loadStorages();
+    const run = async () => {
+      setIsLoading(true);
+
+      try {
+        if (database.id) {
+          const config = await backupConfigApi.getBackupConfigByDbID(database.id);
+          setBackupConfig(config);
+          setIsUnsaved(false);
+          setIsSaving(false);
+        } else {
+          setBackupConfig({
+            databaseId: database.id,
+            isBackupsEnabled: true,
+            backupInterval: {
+              id: undefined as unknown as string,
+              interval: IntervalType.DAILY,
+              timeOfDay: '00:00',
+            },
+            storage: undefined,
+            retentionPolicyType: IS_CLOUD
+              ? RetentionPolicyType.GFS
+              : RetentionPolicyType.TimePeriod,
+            retentionTimePeriod: Period.THREE_MONTH,
+            retentionCount: 100,
+            retentionGfsHours: 24,
+            retentionGfsDays: 7,
+            retentionGfsWeeks: 4,
+            retentionGfsMonths: 12,
+            retentionGfsYears: 3,
+            sendNotificationsOn: [BackupNotificationType.BackupFailed],
+            isRetryIfFailed: true,
+            maxFailedTriesCount: 3,
+            encryption: BackupEncryption.ENCRYPTED,
+          });
+        }
+
+        await loadStorages();
+      } catch (e) {
+        alert((e as Error).message);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    run();
   }, [database]);
 
-  if (!backupConfig) return <div />;
-
-  if (isStoragesLoading) {
+  if (isLoading) {
     return (
       <div className="mb-5 flex items-center">
         <Spin />
       </div>
     );
   }
+
+  if (!backupConfig) return <div />;
 
   const { backupInterval } = backupConfig;
 
@@ -195,10 +242,31 @@ export const EditBackupConfigComponent = ({
       ? getLocalDayOfMonth(backupInterval.dayOfMonth, backupInterval.timeOfDay)
       : backupInterval?.dayOfMonth;
 
-  // mandatory-field check
+  const retentionPolicyType = backupConfig.retentionPolicyType ?? RetentionPolicyType.TimePeriod;
+
+  const isShowGfsHours =
+    backupInterval?.interval === IntervalType.HOURLY ||
+    backupInterval?.interval === IntervalType.CRON;
+
+  const isRetentionValid = (() => {
+    switch (retentionPolicyType) {
+      case RetentionPolicyType.TimePeriod:
+        return Boolean(backupConfig.retentionTimePeriod);
+      case RetentionPolicyType.Count:
+        return (backupConfig.retentionCount ?? 0) > 0;
+      case RetentionPolicyType.GFS:
+        return (
+          (backupConfig.retentionGfsDays ?? 0) > 0 ||
+          (backupConfig.retentionGfsWeeks ?? 0) > 0 ||
+          (backupConfig.retentionGfsMonths ?? 0) > 0 ||
+          (backupConfig.retentionGfsYears ?? 0) > 0
+        );
+    }
+  })();
+
   const isAllFieldsFilled =
     !backupConfig.isBackupsEnabled ||
-    (Boolean(backupConfig.storePeriod) &&
+    (isRetentionValid &&
       Boolean(backupConfig.storage?.id) &&
       Boolean(backupConfig.encryption) &&
       Boolean(backupInterval?.interval) &&
@@ -228,7 +296,18 @@ export const EditBackupConfigComponent = ({
             <div className="mb-1 min-w-[150px] sm:mb-0">Backup interval</div>
             <Select
               value={backupInterval?.interval}
-              onChange={(v) => saveInterval({ interval: v })}
+              onChange={(v) => {
+                saveInterval({ interval: v });
+
+                const isDailyOrMore =
+                  v === IntervalType.DAILY ||
+                  v === IntervalType.WEEKLY ||
+                  v === IntervalType.MONTHLY;
+
+                if (isDailyOrMore && retentionPolicyType === RetentionPolicyType.GFS) {
+                  updateBackupConfig({ retentionGfsHours: 24 });
+                }
+              }}
               size="small"
               className="w-full max-w-[200px] grow"
               options={[
@@ -365,84 +444,11 @@ export const EditBackupConfigComponent = ({
               </div>
             )}
 
-          <div className="mt-4 mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
-            <div className="mb-1 min-w-[150px] sm:mb-0">Retry backup if failed</div>
-            <div className="flex items-center">
-              <Switch
-                size="small"
-                checked={backupConfig.isRetryIfFailed}
-                onChange={(checked) => updateBackupConfig({ isRetryIfFailed: checked })}
-              />
-
-              <Tooltip
-                className="cursor-pointer"
-                title="Automatically retry failed backups. Backups can fail due to network failures, storage issues or temporary database unavailability."
-              >
-                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
-              </Tooltip>
-            </div>
-          </div>
-
-          {backupConfig.isRetryIfFailed && (
-            <div className="mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
-              <div className="mb-1 min-w-[150px] sm:mb-0">Max failed tries count</div>
-              <div className="flex items-center">
-                <InputNumber
-                  min={1}
-                  max={10}
-                  value={backupConfig.maxFailedTriesCount}
-                  onChange={(value) => updateBackupConfig({ maxFailedTriesCount: value || 1 })}
-                  size="small"
-                  className="w-full max-w-[200px] grow"
-                />
-
-                <Tooltip
-                  className="cursor-pointer"
-                  title="Maximum number of retry attempts for failed backups. You will receive a notification when all tries have failed."
-                >
-                  <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
-                </Tooltip>
-              </div>
-            </div>
-          )}
-
-          <div className="mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
-            <div className="mb-1 min-w-[150px] sm:mb-0">Store period</div>
-            <div className="flex items-center">
-              <Select
-                value={backupConfig.storePeriod}
-                onChange={(v) => updateBackupConfig({ storePeriod: v })}
-                size="small"
-                className="w-full max-w-[200px] grow"
-                options={[
-                  { label: '1 day', value: Period.DAY },
-                  { label: '1 week', value: Period.WEEK },
-                  { label: '1 month', value: Period.MONTH },
-                  { label: '3 months', value: Period.THREE_MONTH },
-                  { label: '6 months', value: Period.SIX_MONTH },
-                  { label: '1 year', value: Period.YEAR },
-                  { label: '2 years', value: Period.TWO_YEARS },
-                  { label: '3 years', value: Period.THREE_YEARS },
-                  { label: '4 years', value: Period.FOUR_YEARS },
-                  { label: '5 years', value: Period.FIVE_YEARS },
-                  { label: 'Forever', value: Period.FOREVER },
-                ]}
-              />
-
-              <Tooltip
-                className="cursor-pointer"
-                title="How long to keep the backups? Make sure you have enough storage space."
-              >
-                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
-              </Tooltip>
-            </div>
-          </div>
-
           <div className="mb-3" />
         </>
       )}
 
-      <div className="mt-2 mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
+      <div className="mt-5 mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
         <div className="mb-1 min-w-[150px] sm:mb-0">Storage</div>
         <div className="flex w-full items-center">
           <Select
@@ -480,26 +486,199 @@ export const EditBackupConfigComponent = ({
         </div>
       </div>
 
-      <div className="mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
-        <div className="mb-1 min-w-[150px] sm:mb-0">Encryption</div>
-        <div className="flex items-center">
+      {!IS_CLOUD && (
+        <div className="mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
+          <div className="mb-1 min-w-[150px] sm:mb-0">Encryption</div>
+          <div className="flex items-center">
+            <Select
+              value={backupConfig.encryption}
+              onChange={(v) => updateBackupConfig({ encryption: v })}
+              size="small"
+              className="w-[200px]"
+              options={[
+                { label: 'None', value: BackupEncryption.NONE },
+                { label: 'Encrypt backup files', value: BackupEncryption.ENCRYPTED },
+              ]}
+            />
+
+            <Tooltip
+              className="cursor-pointer"
+              title="If backup is encrypted, backup files in your storage (S3, local, etc.) cannot be used directly. You can restore backups through Databasus or download them unencrypted via the 'Download' button."
+            >
+              <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+            </Tooltip>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-5 mb-1 flex w-full flex-col items-start sm:flex-row sm:items-start">
+        <div className="mt-1 mb-1 min-w-[150px] sm:mb-0">Retention policy</div>
+        <div className="flex flex-col gap-1">
           <Select
-            value={backupConfig.encryption}
-            onChange={(v) => updateBackupConfig({ encryption: v })}
+            value={retentionPolicyType}
+            options={retentionPolicyOptions}
             size="small"
-            className="w-full max-w-[200px] grow"
-            options={[
-              { label: 'None', value: BackupEncryption.NONE },
-              { label: 'Encrypt backup files', value: BackupEncryption.ENCRYPTED },
-            ]}
+            className="w-[200px]"
+            popupMatchSelectWidth={false}
+            onChange={(v) => {
+              const type = v as RetentionPolicyType;
+              const updates: Partial<typeof backupConfig> = { retentionPolicyType: type };
+
+              if (type === RetentionPolicyType.GFS) {
+                updates.retentionGfsHours = 24;
+                updates.retentionGfsDays = 7;
+                updates.retentionGfsWeeks = 4;
+                updates.retentionGfsMonths = 12;
+                updates.retentionGfsYears = 3;
+              } else if (type === RetentionPolicyType.Count) {
+                updates.retentionCount = 100;
+              }
+
+              updateBackupConfig(updates);
+            }}
           />
 
-          <Tooltip
-            className="cursor-pointer"
-            title="If backup is encrypted, backup files in your storage (S3, local, etc.) cannot be used directly. You can restore backups through Databasus or download them unencrypted via the 'Download' button."
-          >
-            <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
-          </Tooltip>
+          {retentionPolicyType === RetentionPolicyType.TimePeriod && (
+            <div className="flex items-center">
+              <Select
+                value={backupConfig.retentionTimePeriod}
+                onChange={(v) => updateBackupConfig({ retentionTimePeriod: v })}
+                size="small"
+                className="w-[200px]"
+                options={[
+                  { label: '1 day', value: Period.DAY },
+                  { label: '1 week', value: Period.WEEK },
+                  { label: '1 month', value: Period.MONTH },
+                  { label: '3 months', value: Period.THREE_MONTH },
+                  { label: '6 months', value: Period.SIX_MONTH },
+                  { label: '1 year', value: Period.YEAR },
+                  { label: '2 years', value: Period.TWO_YEARS },
+                  { label: '3 years', value: Period.THREE_YEARS },
+                  { label: '4 years', value: Period.FOUR_YEARS },
+                  { label: '5 years', value: Period.FIVE_YEARS },
+                  { label: 'Forever', value: Period.FOREVER },
+                ]}
+              />
+
+              <Tooltip
+                className="cursor-pointer"
+                title="How long to keep the backups. Backups older than this period are automatically deleted."
+              >
+                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+              </Tooltip>
+            </div>
+          )}
+
+          {retentionPolicyType === RetentionPolicyType.Count && (
+            <div className="flex items-center">
+              <InputNumber
+                min={1}
+                value={backupConfig.retentionCount}
+                onChange={(v) => updateBackupConfig({ retentionCount: v ?? 1 })}
+                size="small"
+                className="w-[80px]"
+              />
+              <span className="ml-2 text-sm text-gray-600 dark:text-gray-400">
+                most recent backups
+              </span>
+
+              <Tooltip
+                className="cursor-pointer"
+                title="Keep only the specified number of most recent backups. Older backups beyond this count are automatically deleted."
+              >
+                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+              </Tooltip>
+            </div>
+          )}
+
+          {retentionPolicyType === RetentionPolicyType.GFS && (
+            <>
+              <div>
+                <span
+                  className="cursor-pointer text-xs text-blue-600 hover:text-blue-800"
+                  onClick={() => setShowGfsHint(!isShowGfsHint)}
+                >
+                  {isShowGfsHint ? 'Hide' : 'What is GFS (Grandfather-Father-Son)?'}
+                </span>
+
+                {isShowGfsHint && (
+                  <div className="mt-1 max-w-[280px] text-xs text-gray-600 dark:text-gray-400">
+                    GFS (Grandfather-Father-Son) rotation: keep the last N hourly, daily, weekly,
+                    monthly and yearly backups. This allows keeping backups over long periods of
+                    time within a reasonable storage space.
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-col gap-1">
+                {isShowGfsHours && (
+                  <div className="flex items-center gap-2">
+                    <span className="w-[110px] text-sm text-gray-600 dark:text-gray-400">
+                      Hourly backups
+                    </span>
+                    <InputNumber
+                      min={0}
+                      value={backupConfig.retentionGfsHours}
+                      onChange={(v) => updateBackupConfig({ retentionGfsHours: v ?? 0 })}
+                      size="small"
+                      className="w-[80px]"
+                    />
+                  </div>
+                )}
+
+                <div className="flex items-center gap-2">
+                  <span className="w-[110px] text-sm text-gray-600 dark:text-gray-400">
+                    Daily backups
+                  </span>
+                  <InputNumber
+                    min={0}
+                    value={backupConfig.retentionGfsDays}
+                    onChange={(v) => updateBackupConfig({ retentionGfsDays: v ?? 0 })}
+                    size="small"
+                    className="w-[80px]"
+                  />
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="w-[110px] text-sm text-gray-600 dark:text-gray-400">
+                    Weekly backups
+                  </span>
+                  <InputNumber
+                    min={0}
+                    value={backupConfig.retentionGfsWeeks}
+                    onChange={(v) => updateBackupConfig({ retentionGfsWeeks: v ?? 0 })}
+                    size="small"
+                    className="w-[80px]"
+                  />
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="w-[110px] text-sm text-gray-600 dark:text-gray-400">
+                    Monthly backups
+                  </span>
+                  <InputNumber
+                    min={0}
+                    value={backupConfig.retentionGfsMonths}
+                    onChange={(v) => updateBackupConfig({ retentionGfsMonths: v ?? 0 })}
+                    size="small"
+                    className="w-[80px]"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="w-[110px] text-sm text-gray-600 dark:text-gray-400">
+                    Yearly backups
+                  </span>
+                  <InputNumber
+                    min={0}
+                    value={backupConfig.retentionGfsYears}
+                    onChange={(v) => updateBackupConfig({ retentionGfsYears: v ?? 0 })}
+                    size="small"
+                    className="w-[80px]"
+                  />
+                </div>
+              </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -548,9 +727,69 @@ export const EditBackupConfigComponent = ({
         </>
       )}
 
+      <div className="mt-4 mb-1 flex items-center">
+        <div
+          className="flex cursor-pointer items-center text-sm text-blue-600 hover:text-blue-800"
+          onClick={() => setShowAdvanced(!isShowAdvanced)}
+        >
+          <span className="mr-2">Advanced settings</span>
+
+          {isShowAdvanced ? (
+            <UpOutlined style={{ fontSize: '12px' }} />
+          ) : (
+            <DownOutlined style={{ fontSize: '12px' }} />
+          )}
+        </div>
+      </div>
+
+      {isShowAdvanced && backupConfig.isBackupsEnabled && (
+        <>
+          <div className="mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
+            <div className="mb-1 min-w-[150px] sm:mb-0">Retry backup if failed</div>
+            <div className="flex items-center">
+              <Switch
+                size="small"
+                checked={backupConfig.isRetryIfFailed}
+                onChange={(checked) => updateBackupConfig({ isRetryIfFailed: checked })}
+              />
+
+              <Tooltip
+                className="cursor-pointer"
+                title="Automatically retry failed backups. Backups can fail due to network failures, storage issues or temporary database unavailability."
+              >
+                <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+              </Tooltip>
+            </div>
+          </div>
+
+          {backupConfig.isRetryIfFailed && (
+            <div className="mb-1 flex w-full flex-col items-start sm:flex-row sm:items-center">
+              <div className="mb-1 min-w-[150px] sm:mb-0">Max failed tries count</div>
+              <div className="flex items-center">
+                <InputNumber
+                  min={1}
+                  max={10}
+                  value={backupConfig.maxFailedTriesCount}
+                  onChange={(value) => updateBackupConfig({ maxFailedTriesCount: value || 1 })}
+                  size="small"
+                  className="w-full max-w-[75px] grow"
+                />
+
+                <Tooltip
+                  className="cursor-pointer"
+                  title="Maximum number of retry attempts for failed backups. You will receive a notification when all tries have failed."
+                >
+                  <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+                </Tooltip>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
       <div className="mt-5 flex">
         {isShowBackButton && (
-          <Button className="mr-1" onClick={onBack}>
+          <Button className="mr-1" type="primary" ghost onClick={onBack}>
             Back
           </Button>
         )}
@@ -588,6 +827,7 @@ export const EditBackupConfigComponent = ({
           </div>
 
           <EditStorageComponent
+            user={user}
             workspaceId={database.workspaceId}
             isShowName
             isShowClose={false}
